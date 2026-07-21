@@ -1,0 +1,93 @@
+# Telegram Image Publisher
+
+Приватный Telegram-бот для получения оригинальных изображений из Pixiv или по прямой ссылке, предпросмотра метаданных и публикации в один из настроенных каналов. Задания хранятся в БД, поэтому очередь переживает перезапуск приложения.
+
+## Возможности MVP
+
+- allowlist администраторов;
+- Pixiv (обычные ссылки `/artworks/<id>`) и прямые JPG/PNG/WebP/GIF-ссылки;
+- теги, `--channel <alias>`, предпросмотр и подтверждение;
+- сохранённая в SQLite очередь, отмена, ручной retry и повторы временных ошибок;
+- проверка изображений Pillow, отправка фото/документа и медиагруппы до 10 элементов;
+- HTML-подпись с экранированием, дедупликация по источнику и каналу;
+- восстановление зависших загрузок после перезапуска;
+- Docker Compose и systemd unit.
+
+DeviantArt, управление каналами командами и PostgreSQL относятся в исходном ТЗ к этапу после MVP. Схема SQLAlchemy совместима с PostgreSQL; для него установите extra `postgres` и задайте URL `postgresql+asyncpg://...`.
+
+## Требования и установка
+
+Нужны Python 3.12+, доступ в интернет и Telegram-бот с правами публикации в целевых каналах.
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+cp .env.example .env
+```
+
+Создайте бота через [@BotFather](https://t.me/BotFather), скопируйте токен в `BOT_TOKEN`, добавьте бота администратором канала с правом публикации сообщений и узнайте числовой chat ID канала (обычно начинается с `-100`). Не передавайте токен или cookies в сообщения и не коммитьте `.env`.
+
+Минимальная настройка `.env`:
+
+```env
+BOT_TOKEN=123456:secret
+ADMIN_IDS=123456789
+DEFAULT_CHANNEL_ALIAS=artwork
+CHANNELS_JSON={"artwork":{"chat_id":"-1001234567890","title":"Artwork","publish_mode":"auto"}}
+```
+
+`publish_mode` принимает `auto`, `photo` или `document`. В `auto` неподходящие Telegram Photo API изображения отправляются документами без изменения оригинала. Для доступных только авторизованному пользователю работ Pixiv можно задать `PIXIV_COOKIES`; секрет фильтруется из логов. Бот не обходит приватность, DRM и ограничения сайта.
+
+`HTTP_PROXY` или `SOCKS_PROXY` централизованно применяется к источникам и Telegram API (`SOCKS_PROXY` имеет приоритет). HTTP-прокси поддерживается основной установкой; для `socks5://` установите `pip install -e '.[proxy]'`.
+
+## Запуск
+
+```bash
+python -m app.main
+```
+
+При первом старте создаются каталог `data`, SQLite-схема и каналы из `CHANNELS_JSON`. Для production используйте миграции перед обновлением схемы; текущий MVP инициализирует исходную схему через SQLAlchemy.
+
+Пример сообщения:
+
+```text
+https://www.pixiv.net/en/artworks/147382169 art landscape --channel artwork
+```
+
+Команды: `/start`, `/help`, `/status <id>`, `/queue`, `/cancel <id>`, `/retry <id>`, `/recent`, `/channels`, `/providers`, `/stats`, `/health`. Они и callback-кнопки доступны только ID из `ADMIN_IDS`.
+
+## Docker
+
+```bash
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+База и временные файлы находятся в именованных volumes. Перед обновлением сохраните БД:
+
+```bash
+docker compose stop bot
+docker run --rm -v telegram-image-publisher_bot-data:/data -v "$PWD:/backup" alpine tar czf /backup/bot-data.tgz -C /data .
+docker compose up -d --build
+```
+
+Имя volume уточните командой `docker volume ls`. Без Docker скопируйте `data/database.db` после остановки сервиса. Пример systemd unit находится в `deploy/telegram-image-publisher.service`; замените пользователя и пути, затем выполните `systemctl daemon-reload && systemctl enable --now telegram-image-publisher`.
+
+## Тесты и диагностика
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+Сетевые ответы в unit-тестах не используются. Если Pixiv недоступен, проверьте сеть, cookies и HTTP 429/403. Если публикация не проходит, убедитесь, что chat ID корректен и бот может отправлять фото, документы и альбомы. Задание, зависшее на загрузке/обработке, возвращается в очередь; неизвестный результат стадии `publishing` помечается ошибкой, чтобы не создать дубликат автоматически.
+
+## Добавление Provider
+
+1. Реализуйте `BaseProvider` в `app/providers/`.
+2. Возвращайте унифицированный `SourcePost` и `MediaItem`, не вызывая Telegram API.
+3. Зарегистрируйте Provider в `app/bootstrap.py`.
+4. Добавьте unit-тесты URL, нормализации, ошибок доступа, timeout/rate-limit и нескольких файлов. Все сетевые ответы должны быть замокированы.
+
+Downloader повторно проверяет публичный DNS, запрещает redirect при загрузке и ограничивает размер. Это намеренное ограничение SSRF-защиты: прямые ссылки с перенаправлением не принимаются.

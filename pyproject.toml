@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-image-publisher"
+version = "0.1.0"
+description = "Private Telegram bot that publishes artwork from external sources"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.13,<4",
+  "aiohttp>=3.10,<4",
+  "SQLAlchemy>=2.0,<3",
+  "aiosqlite>=0.20,<1",
+  "pydantic-settings>=2.5,<3",
+  "Pillow>=10.4,<12",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29,<1"]
+proxy = ["aiohttp-socks>=0.9,<1"]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.24,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

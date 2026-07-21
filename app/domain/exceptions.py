@@ -41,6 +41,10 @@ class MediaTooLargeError(MediaValidationError):
     code = "media_too_large"
 
 
+class TooManyMediaError(MediaValidationError):
+    code = "too_many_media"
+
+
 class PublishError(ApplicationError):
     code = "publish_error"
     retryable = True

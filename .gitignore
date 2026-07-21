@@ -6,3 +6,4 @@ __pycache__/
 data/
 storage/jobs/
 *.log
+/tg-bot-imagepublisher/

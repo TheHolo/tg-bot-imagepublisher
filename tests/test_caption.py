@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from app.domain.models import SourcePost
 from app.services.caption_service import CaptionService
 
@@ -12,6 +14,42 @@ def test_caption_escapes_untrusted_html():
     assert "&lt;script&gt;" in caption
     assert "A &amp; B" in caption
     assert "#art" in caption
+
+
+def test_caption_includes_clean_description_and_source_date():
+    post = SourcePost(
+        provider="pixiv", source_id="1", source_url="https://x", normalized_url="https://x",
+        title="Title", description="<p>Short &amp; <b>useful</b><br>description.</p>",
+        author_name="Artist", author_url="https://x/artist", media_items=[],
+        published_at=datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc),
+    )
+    caption = CaptionService().build(post, ["art"])
+    assert "Short &amp; useful description." in caption
+    assert "📅 21.07.2026" in caption
+    assert "🔗" in caption and "Оригинал на Pixiv" in caption
+
+
+def test_caption_omits_empty_optional_fields():
+    post = SourcePost(
+        provider="direct", source_id="1", source_url="https://x", normalized_url="https://x",
+        title="Title", author_name="Source", author_url="https://x", media_items=[],
+    )
+    caption = CaptionService().build(post, [])
+    assert "📅" not in caption
+    assert "🏷" not in caption
+    assert "Открыть оригинал" in caption
+
+
+def test_caption_appends_english_title_translation():
+    post = SourcePost(
+        provider="pixiv", source_id="1", source_url="https://x", normalized_url="https://x",
+        title="どうじゃ？", author_name="Artist", author_url="https://x/artist", media_items=[],
+        metadata={"title_translation": "What do you think?", "title_language": "ja"},
+    )
+
+    caption = CaptionService().build(post, [])
+
+    assert "どうじゃ？ (TL: What do you think?)" in caption
 
 
 def test_caption_is_shortened_without_cutting_html():

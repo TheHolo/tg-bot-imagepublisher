@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 from app.domain.exceptions import InvalidUrlError
 
-URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>,]+", re.IGNORECASE)
 
 
 def extract_urls(text: str) -> list[str]:

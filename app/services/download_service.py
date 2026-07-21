@@ -18,7 +18,7 @@ class DownloadService:
         self.storage = storage.resolve()
         self.max_size = max_size
 
-    async def download(self, job_id: int, item: MediaItem) -> DownloadedMedia:
+    async def download(self, job_id: int | str, item: MediaItem) -> DownloadedMedia:
         await ensure_public_dns(item.url)
         directory = (self.storage / "jobs" / str(job_id)).resolve()
         if self.storage not in directory.parents:

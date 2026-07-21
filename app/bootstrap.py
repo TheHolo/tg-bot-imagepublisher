@@ -22,6 +22,8 @@ from app.services.ingest_service import IngestService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.publisher_service import TelegramPublisher
+from app.services.preview_service import PreviewService
+from app.services.translation_service import TranslationService
 
 
 @dataclass
@@ -68,24 +70,41 @@ async def bootstrap(settings: Settings | None = None) -> Application:
     bot_session = AiohttpSession(proxy=proxy_url) if proxy_url else None
     bot = Bot(settings.bot_token, session=bot_session)
     registry = ProviderRegistry([
-        PixivProvider(http, settings.pixiv_cookies),
+        PixivProvider(
+            http, settings.pixiv_cookies,
+            media_limit_enabled=settings.pixiv_media_limit_enabled,
+            max_images=settings.pixiv_max_images,
+        ),
         DirectImageProvider(http, settings.max_download_bytes),
     ])
     jobs = JobService(sessions)
-    ingest = IngestService(registry, settings.max_tags, settings.max_tag_length)
+    ingest = IngestService(registry, settings.max_tags, settings.max_tag_length, settings.max_urls_per_message)
+    downloader = DownloadService(http, settings.storage_path, settings.max_download_bytes)
+    media = MediaService()
+    captions = CaptionService()
+    publisher = TelegramPublisher(bot)
+    translator = TranslationService(
+        http, enabled=settings.auto_translate_titles, timeout=settings.translation_timeout
+    )
+    previews = PreviewService(
+        downloader=downloader, media=media, captions=captions, publisher=publisher,
+        storage=settings.storage_path, auto_add_source_tags=settings.auto_add_source_tags,
+        max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
+    )
     wakeup = asyncio.Event()
     dispatcher = Dispatcher(storage=MemoryStorage())
     middleware = AdminOnlyMiddleware(settings.admin_ids)
-    router = build_router(ingest, jobs, wakeup, registry, settings)
+    router = build_router(ingest, jobs, previews, translator, wakeup, registry, settings)
     router.message.outer_middleware(middleware)
     router.callback_query.outer_middleware(middleware)
     dispatcher.include_router(router)
     workers = WorkerPool(
         bot=bot, sessions=sessions, jobs=jobs,
-        downloader=DownloadService(http, settings.storage_path, settings.max_download_bytes),
-        media=MediaService(), captions=CaptionService(), publisher=TelegramPublisher(bot),
+        downloader=downloader, media=media, captions=captions, publisher=publisher,
         count=settings.worker_count, wakeup=wakeup,
         delete_after_publish=settings.delete_files_after_publish, storage=settings.storage_path,
+        auto_add_source_tags=settings.auto_add_source_tags,
+        max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
     )
     return Application(settings, bot, dispatcher, http, engine, workers)
 
@@ -100,6 +119,8 @@ async def _sync_channels(sessions, settings: Settings) -> None:
             channel.telegram_chat_id = str(values["chat_id"])
             channel.title = values.get("title", alias)
             channel.publish_mode = values.get("publish_mode", "auto")
+            if "publish_interval_seconds" in values:
+                channel.publish_interval_seconds = int(values["publish_interval_seconds"])
             channel.caption_template = values.get("caption_template")
             channel.is_enabled = values.get("enabled", True)
             channel.is_default = alias == settings.default_channel_alias

@@ -25,3 +25,10 @@ def normalize_tags(values: list[str], max_tags: int = 20, max_length: int = 64) 
 
 def hashtags(values: list[str]) -> str:
     return " ".join(f"#{tag}" for tag in values)
+
+
+def merge_tags(
+    user_tags: list[str], source_tags: list[str], max_tags: int = 20, max_length: int = 64
+) -> list[str]:
+    """Merge tags while preserving user priority, order, and configured limits."""
+    return normalize_tags([*user_tags, *source_tags], max_tags=max_tags, max_length=max_length)

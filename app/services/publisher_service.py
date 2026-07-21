@@ -14,14 +14,20 @@ class TelegramPublisher:
         self.bot = bot
 
     async def publish(self, job: Job, post: SourcePost, media: list[PreparedMedia], channel: Channel, caption: str) -> PublicationResult:
+        return await self._send(channel.telegram_chat_id, media, caption)
+
+    async def preview(self, chat_id: int | str, media: list[PreparedMedia], caption: str) -> PublicationResult:
+        return await self._send(chat_id, media, caption)
+
+    async def _send(self, chat_id: int | str, media: list[PreparedMedia], caption: str) -> PublicationResult:
         message_ids: list[int] = []
         try:
             if len(media) == 1:
                 item = media[0]
                 if item.as_document:
-                    message = await self.bot.send_document(channel.telegram_chat_id, FSInputFile(item.path), caption=caption, parse_mode="HTML")
+                    message = await self.bot.send_document(chat_id, FSInputFile(item.path), caption=caption, parse_mode="HTML")
                 else:
-                    message = await self.bot.send_photo(channel.telegram_chat_id, FSInputFile(item.path), caption=caption, parse_mode="HTML")
+                    message = await self.bot.send_photo(chat_id, FSInputFile(item.path), caption=caption, parse_mode="HTML")
                 message_ids.append(message.message_id)
             else:
                 for offset in range(0, len(media), 10):
@@ -31,10 +37,10 @@ class TelegramPublisher:
                         if offset == 0 and index == 0:
                             kwargs.update(caption=caption, parse_mode="HTML")
                         group.append(InputMediaDocument(**kwargs) if item.as_document else InputMediaPhoto(**kwargs))
-                    messages = await self.bot.send_media_group(channel.telegram_chat_id, group)
+                    messages = await self.bot.send_media_group(chat_id, group)
                     message_ids.extend(message.message_id for message in messages)
         except TelegramForbiddenError as error:
             raise ChannelPermissionError("Бот не имеет прав на публикацию в канале") from error
         except (TelegramBadRequest, TelegramNetworkError) as error:
             raise PublishError(str(error)) from error
-        return PublicationResult(str(channel.telegram_chat_id), message_ids, datetime.now(timezone.utc), len(media))
+        return PublicationResult(str(chat_id), message_ids, datetime.now(timezone.utc), len(media))

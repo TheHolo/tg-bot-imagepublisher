@@ -1,10 +1,18 @@
 import asyncio
+import math
 from pathlib import Path
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.domain.exceptions import MediaValidationError
 from app.domain.models import DownloadedMedia, PreparedMedia
+
+PHOTO_MAX_BYTES = 10_000_000
+PHOTO_TARGET_BYTES = 9_500_000
+PHOTO_MAX_DIMENSION_SUM = 10_000
+PHOTO_TARGET_DIMENSION_SUM = 9_800
+PHOTO_MAX_ASPECT_RATIO = 20
+PHOTO_FORMATS = {"JPEG", "PNG", "WEBP"}
 
 
 class MediaService:
@@ -14,8 +22,21 @@ class MediaService:
         except (OSError, UnidentifiedImageError) as error:
             raise MediaValidationError("Изображение повреждено или имеет неизвестный формат") from error
         media.width, media.height = width, height
-        photo_ok = fmt in {"JPEG", "PNG", "WEBP"} and media.size <= 10 * 1024 * 1024 and width + height <= 10000
-        return PreparedMedia(media.path, as_document=(mode == "document" or (mode == "auto" and not photo_ok)), order=media.source.order)
+        if mode == "document":
+            return PreparedMedia(media.path, as_document=True, order=media.source.order)
+
+        aspect_ratio = max(width / height, height / width)
+        photo_compatible = fmt in PHOTO_FORMATS and aspect_ratio <= PHOTO_MAX_ASPECT_RATIO
+        within_limits = media.size <= PHOTO_MAX_BYTES and width + height <= PHOTO_MAX_DIMENSION_SUM
+        if photo_compatible and within_limits:
+            return PreparedMedia(media.path, as_document=False, order=media.source.order)
+
+        if photo_compatible:
+            prepared_path = await asyncio.to_thread(self._fit_for_telegram_photo, media.path)
+            if prepared_path is not None:
+                return PreparedMedia(prepared_path, as_document=False, order=media.source.order)
+
+        return PreparedMedia(media.path, as_document=True, order=media.source.order)
 
     @staticmethod
     def _verify(path: Path) -> tuple[int, int, str | None]:
@@ -23,3 +44,41 @@ class MediaService:
             image.verify()
         with Image.open(path) as image:
             return image.width, image.height, image.format
+
+    @staticmethod
+    def _fit_for_telegram_photo(path: Path) -> Path | None:
+        target = path.with_name(f"{path.stem}_telegram.jpg")
+        try:
+            with Image.open(path) as source:
+                image = ImageOps.exif_transpose(source)
+                if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, "white")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+
+                if sum(image.size) > PHOTO_TARGET_DIMENSION_SUM:
+                    scale = PHOTO_TARGET_DIMENSION_SUM / sum(image.size)
+                    image = image.resize(
+                        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+
+                for attempt in range(6):
+                    quality = max(67, 92 - attempt * 5)
+                    image.save(target, "JPEG", quality=quality, optimize=True, progressive=True)
+                    size = target.stat().st_size
+                    if size <= PHOTO_TARGET_BYTES:
+                        return target
+                    scale = min(0.9, math.sqrt(PHOTO_TARGET_BYTES / size) * 0.95)
+                    image = image.resize(
+                        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+        except (OSError, UnidentifiedImageError):
+            target.unlink(missing_ok=True)
+            return None
+        target.unlink(missing_ok=True)
+        return None

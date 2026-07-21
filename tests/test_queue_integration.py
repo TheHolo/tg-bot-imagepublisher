@@ -1,6 +1,8 @@
 import asyncio
 
-from app.db.models import Channel, Job, User
+from datetime import timedelta
+
+from app.db.models import Channel, Job, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
 from app.services.job_service import JobService
@@ -25,4 +27,121 @@ async def test_claim_is_atomic(tmp_path):
     claimed = first or second
     assert claimed.status == JobStatus.DOWNLOADING
     assert claimed.attempts == 1
+    await engine.dispose()
+
+
+async def test_job_waits_for_its_channel_interval(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'delayed.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(
+            alias="delayed", telegram_chat_id="-1001", title="Delayed",
+            is_default=True, publish_interval_seconds=900,
+            next_publish_at=utcnow() + timedelta(minutes=15),
+        )
+        session.add_all([user, channel])
+        await session.flush()
+        session.add(Job(
+            created_by_user_id=user.id, provider="direct", source_id="x", source_url="https://x/a.jpg",
+            normalized_url="https://x/a.jpg", target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[],
+        ))
+    assert await JobService(sessions).claim_next() is None
+    await engine.dispose()
+
+
+async def test_manual_publish_bypasses_channel_interval(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'manual.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(
+            alias="delayed", telegram_chat_id="-1001", title="Delayed",
+            publish_interval_seconds=3600, next_publish_at=utcnow() + timedelta(hours=1),
+        )
+        session.add_all([user, channel])
+        await session.flush()
+        job = Job(
+            created_by_user_id=user.id, provider="direct", source_id="manual",
+            source_url="https://x/a.jpg", normalized_url="https://x/a.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        session.add(job)
+        await session.flush()
+        job_id = job.id
+    jobs = JobService(sessions)
+    forced = await jobs.force_publish(job_id)
+    assert forced is not None and forced.force_publish
+    claimed = await jobs.claim_next()
+    assert claimed is not None and claimed.id == job_id
+    await engine.dispose()
+
+
+async def test_manual_publish_without_id_selects_oldest_queued_job(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'manual-next.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(
+            alias="delayed", telegram_chat_id="-1001", title="Delayed",
+            publish_interval_seconds=3600, next_publish_at=utcnow() + timedelta(hours=1),
+        )
+        session.add_all([user, channel])
+        await session.flush()
+        older = Job(
+            created_by_user_id=user.id, provider="direct", source_id="older",
+            source_url="https://x/older.jpg", normalized_url="https://x/older.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[], created_at=utcnow() - timedelta(minutes=1),
+        )
+        newer = Job(
+            created_by_user_id=user.id, provider="direct", source_id="newer",
+            source_url="https://x/newer.jpg", normalized_url="https://x/newer.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[], created_at=utcnow(),
+        )
+        session.add_all([newer, older])
+        await session.flush()
+        older_id = older.id
+
+    jobs = JobService(sessions)
+    forced = await jobs.force_next_publish()
+    assert forced is not None and forced.id == older_id and forced.force_publish
+    claimed = await jobs.claim_next()
+    assert claimed is not None and claimed.id == older_id
+    await engine.dispose()
+
+
+async def test_preview_without_id_reads_oldest_queued_job_without_changing_it(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'preview-next.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(alias="main", telegram_chat_id="-1001", title="Main", is_default=True)
+        session.add_all([user, channel])
+        await session.flush()
+        older = Job(
+            created_by_user_id=user.id, provider="direct", source_id="older-preview",
+            source_url="https://x/older.jpg", normalized_url="https://x/older.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[], created_at=utcnow() - timedelta(minutes=1),
+        )
+        newer = Job(
+            created_by_user_id=user.id, provider="direct", source_id="newer-preview",
+            source_url="https://x/newer.jpg", normalized_url="https://x/newer.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[], created_at=utcnow(),
+        )
+        session.add_all([newer, older])
+        await session.flush()
+        older_id = older.id
+
+    jobs = JobService(sessions)
+    previewed = await jobs.next_queued()
+    assert previewed is not None and previewed.id == older_id
+    unchanged = await jobs.get(older_id)
+    assert unchanged is not None and unchanged.status == JobStatus.QUEUED
+    assert unchanged.force_publish is False
     await engine.dispose()

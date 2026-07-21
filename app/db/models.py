@@ -35,6 +35,8 @@ class Channel(Base):
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     publish_mode: Mapped[str] = mapped_column(String(16), default="auto")
+    publish_interval_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    next_publish_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     caption_template: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -64,6 +66,7 @@ class Job(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     allow_duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
+    force_publish: Mapped[bool] = mapped_column(Boolean, default=False)
     channel: Mapped[Channel] = relationship()
     media_items: Mapped[list["MediaRecord"]] = relationship(cascade="all, delete-orphan")
 

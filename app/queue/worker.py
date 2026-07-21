@@ -1,33 +1,26 @@
 import asyncio
 import logging
 import shutil
+from datetime import timedelta
 from pathlib import Path
 
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import Job, MediaRecord, Publication
-from app.domain.enums import JobStatus, MediaType
+from app.db.models import Channel, Job, MediaRecord, Publication
+from app.domain.enums import JobStatus
 from app.domain.exceptions import ApplicationError, DuplicatePublicationError
-from app.domain.models import MediaItem, SourcePost
 from app.services.caption_service import CaptionService
 from app.services.download_service import DownloadService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
 from app.services.publisher_service import TelegramPublisher
+from app.services.preview_service import deserialize_post
+from app.services.translation_service import TranslationService
+from app.utils.tags import merge_tags
 
 logger = logging.getLogger(__name__)
 RETRY_DELAYS = (5, 30, 120)
-
-
-def deserialize_post(data: dict) -> SourcePost:
-    items = [MediaItem(**{**item, "media_type": MediaType(item.get("media_type", "image"))}) for item in data["media_items"]]
-    return SourcePost(
-        provider=data["provider"], source_id=data["source_id"], source_url=data["source_url"],
-        normalized_url=data["normalized_url"], title=data["title"], description=data.get("description", ""),
-        author_id=data.get("author_id"), author_name=data["author_name"], author_url=data["author_url"],
-        source_tags=data.get("source_tags", []), media_items=items, metadata=data.get("metadata", {}),
-    )
 
 
 class WorkerPool:
@@ -35,12 +28,16 @@ class WorkerPool:
         self, *, bot: Bot, sessions: async_sessionmaker[AsyncSession], jobs: JobService,
         downloader: DownloadService, media: MediaService, captions: CaptionService,
         publisher: TelegramPublisher, count: int, wakeup: asyncio.Event,
-        delete_after_publish: bool, storage: Path,
+        delete_after_publish: bool, storage: Path, auto_add_source_tags: bool,
+        max_tags: int, max_tag_length: int, translator: TranslationService,
     ) -> None:
         self.bot, self.sessions, self.jobs = bot, sessions, jobs
         self.downloader, self.media, self.captions, self.publisher = downloader, media, captions, publisher
+        self.translator = translator
         self.count, self.wakeup = count, wakeup
         self.delete_after_publish, self.storage = delete_after_publish, storage
+        self.auto_add_source_tags = auto_add_source_tags
+        self.max_tags, self.max_tag_length = max_tags, max_tag_length
         self.tasks: list[asyncio.Task] = []
         self.stopping = False
 
@@ -80,6 +77,7 @@ class WorkerPool:
 
     async def _process(self, job: Job) -> None:
         post = deserialize_post(job.post_data)
+        await self.translator.enrich_title(post)
         duplicate = await self.jobs.duplicate(job)
         if duplicate and not job.allow_duplicate:
             raise DuplicatePublicationError(f"Эта публикация уже отправлена в канал {job.channel.alias}")
@@ -91,7 +89,10 @@ class WorkerPool:
             downloaded.append(await self.downloader.download(job.id, item))
         await self.jobs.transition(job.id, JobStatus.PROCESSING)
         prepared = [await self.media.prepare(item, job.channel.publish_mode) for item in downloaded]
-        caption = self.captions.build(post, job.user_tags, job.channel.caption_template or self.captions_template)
+        caption_tags = job.user_tags
+        if self.auto_add_source_tags:
+            caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
+        caption = self.captions.build(post, caption_tags, job.channel.caption_template or self.captions_template)
         await self.jobs.transition(job.id, JobStatus.PUBLISHING)
         result = await self.publisher.publish(job, post, prepared, job.channel, caption)
         async with self.sessions() as session, session.begin():
@@ -99,6 +100,11 @@ class WorkerPool:
                 job_id=job.id, channel_id=job.target_channel_id, telegram_chat_id=result.chat_id,
                 telegram_message_ids=result.message_ids, published_at=result.published_at, caption=caption,
             ))
+            channel = await session.get(Channel, job.target_channel_id)
+            if channel and channel.publish_interval_seconds:
+                channel.next_publish_at = result.published_at + timedelta(seconds=channel.publish_interval_seconds)
+            elif channel:
+                channel.next_publish_at = None
             for source, downloaded_item, prepared_item, message_id in zip(
                 post.media_items, downloaded, prepared, result.message_ids, strict=False
             ):

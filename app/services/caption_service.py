@@ -3,11 +3,14 @@ from html import escape
 from app.domain.exceptions import MediaValidationError
 from app.domain.models import SourcePost
 from app.utils.tags import hashtags
+from app.utils.text import shorten
 
 
 DEFAULT_TEMPLATE = (
-    '<b>{title}</b>\n\nАвтор: <a href="{author_url}">{author_name}</a>\n'
-    'Источник: <a href="{source_url}">{provider_name}</a>\n\n{hashtags}'
+    '🖼 <b>{title}</b>\n\n{description_block}'
+    '🎨 <a href="{author_url}">{author_name}</a>\n'
+    '🔗 <a href="{source_url}">{source_label}</a>\n'
+    '{published_at_block}\n{hashtags_block}'
 )
 
 
@@ -16,23 +19,41 @@ class CaptionService:
         self.limit = limit
 
     def build(self, post: SourcePost, tags: list[str], template: str = DEFAULT_TEMPLATE) -> str:
-        values = {
-            "title": escape(post.title or "Без названия"),
+        title = post.title or "Без названия"
+        translated_title = str(post.metadata.get("title_translation") or "").strip()
+        if translated_title and translated_title.casefold() != title.casefold():
+            title = f"{title} (TL: {translated_title})"
+        description = shorten(post.description, 240)
+        current_tags = list(tags)
+
+        def render() -> str:
+            provider_name = post.provider.title()
+            values = {
+            "title": escape(title),
             "author_name": escape(post.author_name or "Неизвестный автор"),
             "author_url": escape(post.author_url, quote=True),
             "source_url": escape(post.normalized_url, quote=True),
-            "provider_name": escape(post.provider.title()),
-            "hashtags": hashtags(tags),
-        }
-        caption = template.format_map(values)
+            "provider_name": escape(provider_name),
+            "source_label": escape(f"Оригинал на {provider_name}" if post.provider != "direct" else "Открыть оригинал"),
+            "description_block": f"{escape(description)}\n\n" if description else "",
+            "published_at_block": f"📅 {post.published_at:%d.%m.%Y}\n" if post.published_at else "",
+            "hashtags": hashtags(current_tags),
+            "hashtags_block": f"🏷 {hashtags(current_tags)}" if current_tags else "",
+            }
+            return template.format_map(values).rstrip()
+
+        caption = render()
         if len(caption) <= self.limit:
             return caption
-        # Keep valid HTML and the required links; shorten only plain title and tags.
-        values["hashtags"] = ""
-        over = len(template.format_map(values)) - self.limit
-        if over > 0:
-            values["title"] = values["title"][: max(1, len(values["title"]) - over - 1)] + "…"
-        caption = template.format_map(values).rstrip()
+        while description and len(caption) > self.limit:
+            description = shorten(description, max(0, len(description) - (len(caption) - self.limit) - 1))
+            caption = render()
+        if len(caption) > self.limit:
+            current_tags = []
+            caption = render()
+        while len(title) > 1 and len(caption) > self.limit:
+            title = title[: max(1, len(title) - (len(caption) - self.limit) - 1)].rstrip() + "…"
+            caption = render()
         if len(caption) > self.limit:
             raise MediaValidationError("Обязательные поля подписи превышают лимит Telegram")
         return caption

@@ -21,6 +21,7 @@ def serialize_post(post: SourcePost) -> dict:
         "author_name": post.author_name,
         "author_url": post.author_url,
         "source_tags": post.source_tags,
+        "published_at": post.published_at.isoformat() if post.published_at else None,
         "media_items": [
             {
                 "url": item.url,
@@ -70,6 +71,18 @@ class JobService:
         async with self.sessions() as session:
             return list((await session.scalars(select(Channel).order_by(Channel.alias))).all())
 
+    async def set_channel_interval(self, alias: str, seconds: int) -> Channel | None:
+        async with self.sessions() as session, session.begin():
+            channel = await session.scalar(select(Channel).where(Channel.alias == alias, Channel.is_enabled.is_(True)))
+            if not channel:
+                return None
+            channel.publish_interval_seconds = seconds
+            last_published = await session.scalar(
+                select(func.max(Publication.published_at)).where(Publication.channel_id == channel.id)
+            )
+            channel.next_publish_at = last_published + timedelta(seconds=seconds) if last_published and seconds else None
+            return channel
+
     async def create_preview(
         self, user_id: int, post: SourcePost, channel_id: int, tags: list[str], max_attempts: int
     ) -> Job:
@@ -95,6 +108,21 @@ class JobService:
         async with self.sessions() as session:
             return await session.scalar(
                 select(Job).options(selectinload(Job.channel), selectinload(Job.media_items)).where(Job.id == job_id)
+            )
+
+    async def next_queued(self) -> Job | None:
+        async with self.sessions() as session:
+            return await session.scalar(
+                select(Job)
+                .join(Channel, Job.target_channel_id == Channel.id)
+                .options(selectinload(Job.channel))
+                .where(
+                    Job.status == JobStatus.QUEUED,
+                    Job.cancel_requested.is_(False),
+                    Channel.is_enabled.is_(True),
+                )
+                .order_by(Job.created_at, Job.id)
+                .limit(1)
             )
 
     async def transition(self, job_id: int, status: JobStatus, message: str | None = None) -> Job | None:
@@ -127,12 +155,19 @@ class JobService:
         async with self.sessions() as session, session.begin():
             candidate = (
                 select(Job.id)
+                .join(Channel, Job.target_channel_id == Channel.id)
                 .where(
                     Job.status == JobStatus.QUEUED,
                     Job.cancel_requested.is_(False),
                     or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= utcnow()),
+                    Channel.is_enabled.is_(True),
+                    or_(
+                        Job.force_publish.is_(True),
+                        Channel.next_publish_at.is_(None),
+                        Channel.next_publish_at <= utcnow(),
+                    ),
                 )
-                .order_by(Job.created_at)
+                .order_by(Job.force_publish.desc(), Job.created_at)
                 .limit(1)
             )
             claimed_id = await session.scalar(
@@ -147,6 +182,46 @@ class JobService:
             if claimed_id is None:
                 return None
             return await session.scalar(select(Job).options(selectinload(Job.channel)).where(Job.id == claimed_id))
+
+    async def force_publish(self, job_id: int) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not job or job.status != JobStatus.QUEUED or job.cancel_requested:
+                return None
+            job.force_publish = True
+            session.add(JobEvent(
+                job_id=job.id, event_type="manual_publish", old_status=job.status,
+                new_status=job.status, message="Manual publication requested",
+            ))
+            return job
+
+    async def force_next_publish(self) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            candidate = (
+                select(Job.id)
+                .join(Channel, Job.target_channel_id == Channel.id)
+                .where(
+                    Job.status == JobStatus.QUEUED,
+                    Job.cancel_requested.is_(False),
+                    Channel.is_enabled.is_(True),
+                )
+                .order_by(Job.created_at, Job.id)
+                .limit(1)
+            )
+            forced_id = await session.scalar(
+                update(Job)
+                .where(Job.id == candidate.scalar_subquery(), Job.status == JobStatus.QUEUED)
+                .values(force_publish=True)
+                .returning(Job.id)
+            )
+            if forced_id is None:
+                return None
+            job = await session.get(Job, forced_id)
+            session.add(JobEvent(
+                job_id=job.id, event_type="manual_publish", old_status=job.status,
+                new_status=job.status, message="Manual publication requested for next queued job",
+            ))
+            return job
 
     async def request_cancel(self, job_id: int) -> bool:
         async with self.sessions() as session, session.begin():

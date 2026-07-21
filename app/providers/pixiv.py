@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -8,6 +9,7 @@ from app.domain.exceptions import (
     SourceAccessDeniedError,
     SourceNotFoundError,
     SourceRateLimitedError,
+    TooManyMediaError,
 )
 from app.domain.models import MediaItem, SourcePost
 from app.providers.base import BaseProvider
@@ -17,9 +19,14 @@ class PixivProvider(BaseProvider):
     name = "pixiv"
     _id_re = re.compile(r"/(?:en/)?artworks/(\d+)")
 
-    def __init__(self, session: aiohttp.ClientSession, cookies: str | None = None) -> None:
+    def __init__(
+        self, session: aiohttp.ClientSession, cookies: str | None = None,
+        media_limit_enabled: bool = True, max_images: int = 10,
+    ) -> None:
         super().__init__(session)
         self.cookies = cookies
+        self.media_limit_enabled = media_limit_enabled
+        self.max_images = max_images
 
     def can_handle(self, url: str) -> bool:
         host = (urlsplit(url).hostname or "").lower()
@@ -59,6 +66,10 @@ class PixivProvider(BaseProvider):
         normalized = self.normalize_url(url)
         detail = await self._json(f"https://www.pixiv.net/ajax/illust/{source_id}")
         pages = await self._json(f"https://www.pixiv.net/ajax/illust/{source_id}/pages")
+        if self.media_limit_enabled and len(pages) > self.max_images:
+            raise TooManyMediaError(
+                f"В работе Pixiv {len(pages)} изображений. Допустимый максимум — {self.max_images}."
+            )
         media = [
             MediaItem(
                 url=page["urls"]["original"],
@@ -84,6 +95,7 @@ class PixivProvider(BaseProvider):
             author_url=f"https://www.pixiv.net/en/users/{user_id}" if user_id else normalized,
             source_tags=[item["tag"] for item in detail.get("tags", {}).get("tags", [])],
             media_items=media,
+            published_at=_parse_datetime(detail.get("createDate")),
             metadata={"page_count": len(media)},
         )
 
@@ -91,3 +103,12 @@ class PixivProvider(BaseProvider):
 def _extension(url: str) -> str:
     suffix = urlsplit(url).path.rsplit("/", 1)[-1].rsplit(".", 1)
     return f".{suffix[-1].lower()}" if len(suffix) == 2 else ".jpg"
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

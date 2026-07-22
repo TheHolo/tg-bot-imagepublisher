@@ -1,5 +1,6 @@
-from html import escape
 import logging
+from datetime import datetime, timezone
+from html import escape
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -69,6 +70,10 @@ def replace_channel_line(text: str, alias: str) -> str:
     return "\n".join(f"Канал: {alias}" if line.startswith("Канал: ") else line for line in lines)
 
 
+def queue_summary_line(post_count: int, completion: datetime, now: datetime) -> str:
+    return f"Всего постов: {post_count} · Вся очередь: {format_countdown(completion, now)}"
+
+
 def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
     translator: TranslationService, wakeup, registry, settings,
@@ -135,7 +140,7 @@ def build_router(
         if alias and len(alias.split()) != 1:
             await message.answer("Использование: /queue [alias]")
             return
-        rows = await jobs.queue(alias)
+        rows = await jobs.queue(alias, limit=None if alias else 50)
         if rows is None:
             await message.answer(f"Канал {escape(alias)} не найден или отключён.")
             return
@@ -144,11 +149,22 @@ def build_router(
                 f"Очередь канала {escape(alias)} пуста." if alias else "Очередь пуста."
             )
             return
-        await message.answer("\n".join(
-            f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {format_countdown(estimate)}"
+        now = datetime.now(timezone.utc)
+        schedule = estimate_queue_schedule(rows, now)
+        lines = [
+            f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {format_countdown(estimate, now)}"
             f"{' · вручную' if job.force_publish else ''}"
-            for job, estimate in estimate_queue_schedule(rows)
-        ))
+            for job, estimate in schedule[:50]
+        ]
+        if alias:
+            completion = max(estimate for _, estimate in schedule)
+            lines.insert(
+                0,
+                queue_summary_line(len(rows), completion, now),
+            )
+            if len(schedule) > 50:
+                lines.append(f"…показаны первые 50 из {len(schedule)} заданий.")
+        await message.answer("\n".join(lines))
 
     @router.message(Command("publish"))
     async def publish_job(message: Message, command: CommandObject) -> None:
@@ -456,10 +472,19 @@ def build_router(
                 job = await jobs.create_preview(user.id, post, channel.id, tags, settings.max_job_attempts)
                 combined_tags = effective_tags(tags, post.source_tags)
                 prefix = f"Ссылка {position}/{len(urls)}\n\n" if len(urls) > 1 else ""
-                duplicate = await jobs.duplicate_for(post.provider, post.source_id, channel.id)
-                if duplicate:
+                duplicate_state = await jobs.duplicate_state_for(
+                    post.provider, post.source_id, channel.id, job.id,
+                )
+                if duplicate_state:
+                    duplicate_message = (
+                        f"Эта публикация уже была отправлена в канал {escape(channel.alias)}. "
+                        "Повторить публикацию?"
+                        if duplicate_state == "published"
+                        else f"Эта публикация уже ожидает обработки для канала {escape(channel.alias)}. "
+                        "Добавить её повторно?"
+                    )
                     await message.answer(
-                        prefix + f"Эта публикация уже была отправлена в канал {escape(channel.alias)}. Повторить публикацию?",
+                        prefix + duplicate_message,
                         reply_markup=duplicate_keyboard(job.id),
                     )
                     continue

@@ -1,7 +1,10 @@
+from datetime import datetime, timedelta, timezone
+
 from app.bot.router import (
     cancel_tag_input_keyboard,
     channel_selection_keyboard,
     queued_preview_keyboard,
+    queue_summary_line,
     replace_channel_line,
 )
 from app.db.models import Channel
@@ -55,3 +58,11 @@ def test_replace_channel_line_keeps_the_rest_of_preview():
     text = "Источник: Pixiv\nКанал: artwork\n\nТеги: #art"
 
     assert replace_channel_line(text, "arknights") == "Источник: Pixiv\nКанал: arknights\n\nТеги: #art"
+
+
+def test_channel_queue_summary_shows_count_and_total_time():
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+
+    assert queue_summary_line(7, now + timedelta(hours=13, minutes=53, seconds=10), now) == (
+        "Всего постов: 7 · Вся очередь: через 13ч 53м 10с"
+    )

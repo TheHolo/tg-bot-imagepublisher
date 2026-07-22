@@ -2,7 +2,7 @@ import asyncio
 
 from datetime import timedelta
 
-from app.db.models import Channel, Job, User, utcnow
+from app.db.models import Channel, Job, Publication, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
 from app.domain.models import SourcePost
@@ -232,4 +232,70 @@ async def test_disabled_last_selected_channel_falls_back_to_default(tmp_path):
 
     preferred = await JobService(sessions).get_preferred_channel(user_id, "artwork")
     assert preferred is not None and preferred.id == default_id
+    await engine.dispose()
+
+
+async def test_duplicate_check_includes_active_jobs_but_excludes_current_preview(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'active-duplicate.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(alias="artwork", telegram_chat_id="-1001", title="Artwork")
+        session.add_all([user, channel])
+        await session.flush()
+        current = Job(
+            created_by_user_id=user.id, provider="pixiv", source_id="123",
+            source_url="https://x/current", normalized_url="https://x/current",
+            target_channel_id=channel.id, status=JobStatus.WAITING_CONFIRMATION,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        session.add(current)
+        await session.flush()
+        user_id, channel_id, current_id = user.id, channel.id, current.id
+
+    jobs = JobService(sessions)
+    assert await jobs.duplicate_state_for("pixiv", "123", channel_id, current_id) is None
+
+    async with sessions() as session, session.begin():
+        duplicate = Job(
+            created_by_user_id=user_id, provider="pixiv", source_id="123",
+            source_url="https://x/queued", normalized_url="https://x/queued",
+            target_channel_id=channel_id, status=JobStatus.QUEUED,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        session.add(duplicate)
+
+    assert await jobs.duplicate_state_for("pixiv", "123", channel_id, current_id) == "active"
+    await engine.dispose()
+
+
+async def test_duplicate_check_prioritizes_completed_publication(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'published-duplicate.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(alias="artwork", telegram_chat_id="-1001", title="Artwork")
+        session.add_all([user, channel])
+        await session.flush()
+        published = Job(
+            created_by_user_id=user.id, provider="pixiv", source_id="123",
+            source_url="https://x/published", normalized_url="https://x/published",
+            target_channel_id=channel.id, status=JobStatus.COMPLETED,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        current = Job(
+            created_by_user_id=user.id, provider="pixiv", source_id="123",
+            source_url="https://x/current", normalized_url="https://x/current",
+            target_channel_id=channel.id, status=JobStatus.WAITING_CONFIRMATION,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        session.add_all([published, current])
+        await session.flush()
+        session.add(Publication(
+            job_id=published.id, channel_id=channel.id, telegram_chat_id=channel.telegram_chat_id,
+            telegram_message_ids=[1], caption="caption",
+        ))
+        channel_id, current_id = channel.id, current.id
+
+    assert await JobService(sessions).duplicate_state_for("pixiv", "123", channel_id, current_id) == "published"
     await engine.dispose()

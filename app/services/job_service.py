@@ -284,14 +284,30 @@ class JobService:
                 .limit(1)
             )
 
-    async def duplicate_for(self, provider: str, source_id: str, channel_id: int) -> Publication | None:
+    async def duplicate_state_for(
+        self, provider: str, source_id: str, channel_id: int, exclude_job_id: int,
+    ) -> str | None:
         async with self.sessions() as session:
-            return await session.scalar(
+            publication = await session.scalar(
                 select(Publication)
                 .join(Job, Publication.job_id == Job.id)
                 .where(Job.provider == provider, Job.source_id == source_id, Publication.channel_id == channel_id)
                 .limit(1)
             )
+            if publication:
+                return "published"
+            active_job_id = await session.scalar(
+                select(Job.id)
+                .where(
+                    Job.id != exclude_job_id,
+                    Job.provider == provider,
+                    Job.source_id == source_id,
+                    Job.target_channel_id == channel_id,
+                    Job.status.in_(ACTIVE_JOB_STATUSES | {JobStatus.WAITING_CONFIRMATION}),
+                )
+                .limit(1)
+            )
+            return "active" if active_job_id is not None else None
 
     async def allow_duplicate_and_enqueue(self, job_id: int) -> bool:
         async with self.sessions() as session, session.begin():

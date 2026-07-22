@@ -140,7 +140,10 @@ def build_router(
         if alias and len(alias.split()) != 1:
             await message.answer("Использование: /queue [alias]")
             return
-        rows = await jobs.queue(alias, limit=None if alias else 50)
+        # The display limit must be applied after schedules from all channels
+        # are merged. Limiting the database query here can hide whole channels
+        # because JobService.queue orders rows by channel alias.
+        rows = await jobs.queue(alias, limit=None)
         if rows is None:
             await message.answer(f"Канал {escape(alias)} не найден или отключён.")
             return
@@ -162,8 +165,8 @@ def build_router(
                 0,
                 queue_summary_line(len(rows), completion, now),
             )
-            if len(schedule) > 50:
-                lines.append(f"…показаны первые 50 из {len(schedule)} заданий.")
+        if len(schedule) > 50:
+            lines.append(f"…показаны ближайшие 50 из {len(schedule)} заданий.")
         await message.answer("\n".join(lines))
 
     @router.message(Command("publish"))

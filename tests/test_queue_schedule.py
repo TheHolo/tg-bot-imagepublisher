@@ -35,6 +35,30 @@ def test_queue_slots_are_calculated_independently_per_channel():
     assert schedule[3] == now + timedelta(minutes=20)
 
 
+def test_queue_schedule_is_merged_chronologically_across_channels():
+    now = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    arknights = SimpleNamespace(
+        alias="arknights", publish_interval_seconds=1800,
+        next_publish_at=now + timedelta(minutes=25),
+    )
+    spice_and_wolf = SimpleNamespace(
+        alias="spice_and_wolf", publish_interval_seconds=7200,
+        next_publish_at=now + timedelta(minutes=30),
+    )
+    jobs = [
+        *[
+            make_job(job_id, arknights, now + timedelta(seconds=job_id))
+            for job_id in range(1, 52)
+        ],
+        make_job(100, spice_and_wolf, now),
+    ]
+
+    schedule = estimate_queue_schedule(jobs, now)
+
+    assert [job.id for job, _ in schedule[:3]] == [1, 100, 2]
+    assert any(job.channel.alias == "spice_and_wolf" for job, _ in schedule[:50])
+
+
 def test_manual_job_resets_channel_timer_for_regular_jobs():
     now = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
     channel = SimpleNamespace(

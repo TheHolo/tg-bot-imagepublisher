@@ -46,7 +46,17 @@ def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> lis
             result.append((job, estimate))
             next_channel_slot = estimate + interval
 
-    return result
+    # Merge independently calculated channel schedules into one chronological
+    # queue. This keeps /queue useful when one channel has many more jobs than
+    # another and gives deterministic ordering for equal publication times.
+    return sorted(
+        result,
+        key=lambda item: (
+            _aware_utc(item[1]),
+            _aware_utc(item[0].created_at),
+            item[0].id,
+        ),
+    )
 
 
 def next_queued_by_schedule(

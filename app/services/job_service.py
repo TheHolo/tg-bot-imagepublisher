@@ -67,6 +67,25 @@ class JobService:
                 statement = statement.where(Channel.is_default.is_(True))
             return await session.scalar(statement)
 
+    async def get_preferred_channel(self, user_id: int, default_alias: str) -> Channel | None:
+        async with self.sessions() as session:
+            user = await session.get(User, user_id)
+            if user and user.last_selected_channel_id is not None:
+                channel = await session.scalar(
+                    select(Channel).where(
+                        Channel.id == user.last_selected_channel_id,
+                        Channel.is_enabled.is_(True),
+                    )
+                )
+                if channel:
+                    return channel
+            return await session.scalar(
+                select(Channel).where(
+                    Channel.alias == default_alias,
+                    Channel.is_enabled.is_(True),
+                )
+            )
+
     async def channels(self) -> list[Channel]:
         async with self.sessions() as session:
             return list((await session.scalars(select(Channel).order_by(Channel.alias))).all())
@@ -101,6 +120,9 @@ class JobService:
                 max_attempts=max_attempts,
             )
             session.add(job)
+            user = await session.get(User, user_id)
+            if user:
+                user.last_selected_channel_id = channel_id
             await session.flush()
             return job
 
@@ -254,14 +276,19 @@ class JobService:
             if job.status == JobStatus.FAILED:
                 job.finished_at = utcnow()
 
-    async def change_channel(self, job_id: int, alias: str) -> bool:
+    async def change_channel(self, job_id: int, channel_id: int) -> Channel | None:
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
-            channel = await session.scalar(select(Channel).where(Channel.alias == alias, Channel.is_enabled.is_(True)))
+            channel = await session.scalar(
+                select(Channel).where(Channel.id == channel_id, Channel.is_enabled.is_(True))
+            )
             if not job or not channel or job.status != JobStatus.WAITING_CONFIRMATION:
-                return False
+                return None
             job.target_channel_id = channel.id
-            return True
+            user = await session.get(User, job.created_by_user_id)
+            if user:
+                user.last_selected_channel_id = channel.id
+            return channel
 
     async def duplicate(self, job: Job) -> Publication | None:
         async with self.sessions() as session:

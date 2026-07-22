@@ -51,6 +51,23 @@ def cancel_tag_input_keyboard(job_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def channel_selection_keyboard(job_id: int, channels, current_channel_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'✓ ' if channel.id == current_channel_id else ''}{channel.alias} — {channel.title}"[:64],
+            callback_data=f"channel_select:{job_id}:{channel.id}",
+        )]
+        for channel in channels
+    ]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data=f"channel_select_cancel:{job_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def replace_channel_line(text: str, alias: str) -> str:
+    lines = text.splitlines()
+    return "\n".join(f"Канал: {alias}" if line.startswith("Канал: ") else line for line in lines)
+
+
 def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
     translator: TranslationService, wakeup, registry, settings,
@@ -79,7 +96,7 @@ def build_router(
     async def channels(message: Message) -> None:
         rows = await jobs.channels()
         await message.answer("\n".join(
-            f"{item.alias} — {item.title}{' (по умолчанию)' if item.is_default else ''}; "
+            f"{item.alias} — {item.title}{' (резервный)' if item.is_default else ''}; "
             f"интервал: {format_duration(item.publish_interval_seconds)}"
             for item in rows
         ) or "Каналы не настроены.")
@@ -309,10 +326,36 @@ def build_router(
     @router.callback_query(F.data.startswith("channel:"))
     async def edit_channel(callback: CallbackQuery, state: FSMContext) -> None:
         job_id = int(callback.data.split(":", 1)[1])
-        await state.set_state(EditPreview.waiting_for_channel)
-        await state.update_data(job_id=job_id)
-        aliases = ", ".join(channel.alias for channel in await jobs.channels() if channel.is_enabled)
-        await callback.message.answer(f"Отправьте alias канала. Доступны: {aliases}")
+        job = await jobs.get(job_id)
+        if not job or job.status != JobStatus.WAITING_CONFIRMATION:
+            await callback.answer("Предпросмотр уже недоступен.", show_alert=True)
+            return
+        channels = [channel for channel in await jobs.channels() if channel.is_enabled]
+        if not channels:
+            await callback.answer("Нет доступных каналов.", show_alert=True)
+            return
+        await state.clear()
+        await callback.message.edit_reply_markup(
+            reply_markup=channel_selection_keyboard(job_id, channels, job.target_channel_id)
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("channel_select:"))
+    async def select_channel(callback: CallbackQuery) -> None:
+        _, raw_job_id, raw_channel_id = callback.data.split(":", 2)
+        job_id, channel_id = int(raw_job_id), int(raw_channel_id)
+        channel = await jobs.change_channel(job_id, channel_id)
+        if not channel:
+            await callback.answer("Канал недоступен или предпросмотр уже закрыт.", show_alert=True)
+            return
+        updated_text = replace_channel_line(callback.message.text or "", channel.alias)
+        await callback.message.edit_text(updated_text, reply_markup=preview_keyboard(job_id))
+        await callback.answer(f"Выбран канал: {channel.alias}")
+
+    @router.callback_query(F.data.startswith("channel_select_cancel:"))
+    async def cancel_channel_selection(callback: CallbackQuery) -> None:
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        await callback.message.edit_reply_markup(reply_markup=preview_keyboard(job_id))
         await callback.answer()
 
     @router.message(EditPreview.waiting_for_tags)
@@ -362,22 +405,16 @@ def build_router(
             reply_markup=queued_preview_keyboard(job.id),
         )
 
-    @router.message(EditPreview.waiting_for_channel)
-    async def receive_channel(message: Message, state: FSMContext) -> None:
-        data = await state.get_data()
-        alias = (message.text or "").strip().lower()
-        if not await jobs.change_channel(data["job_id"], alias):
-            await message.answer("Канал не найден или предпросмотр уже недоступен. Попробуйте ещё раз.")
-            return
-        await state.clear()
-        await message.answer(f"Канал изменён на {escape(alias)}.", reply_markup=preview_keyboard(data["job_id"]))
-
     @router.message(F.text)
     async def submission(message: Message) -> None:
         user = await jobs.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
         try:
             urls, tags, alias = ingest.parse(message.text)
-            channel = await jobs.get_channel(alias or settings.default_channel_alias)
+            channel = (
+                await jobs.get_channel(alias)
+                if alias
+                else await jobs.get_preferred_channel(user.id, settings.default_channel_alias)
+            )
             if not channel:
                 await message.answer("Канал не найден или отключён. Проверьте --channel и CHANNELS_JSON.")
                 return

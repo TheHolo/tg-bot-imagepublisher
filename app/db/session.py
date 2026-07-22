@@ -23,6 +23,9 @@ async def create_schema(engine: AsyncEngine) -> None:
 
 def _upgrade_schema(connection) -> None:
     """Apply additive MVP migrations to databases created by older versions."""
+    user_columns = {column["name"] for column in inspect(connection).get_columns("users")}
+    if "last_selected_channel_id" not in user_columns:
+        connection.execute(text("ALTER TABLE users ADD COLUMN last_selected_channel_id INTEGER NULL"))
     columns = {column["name"] for column in inspect(connection).get_columns("channels")}
     if "publish_interval_seconds" not in columns:
         connection.execute(text("ALTER TABLE channels ADD COLUMN publish_interval_seconds INTEGER NOT NULL DEFAULT 0"))

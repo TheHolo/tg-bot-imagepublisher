@@ -5,6 +5,7 @@ from datetime import timedelta
 from app.db.models import Channel, Job, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
+from app.domain.models import SourcePost
 from app.services.job_service import JobService
 
 
@@ -180,4 +181,51 @@ async def test_queue_can_be_filtered_by_channel_alias(tmp_path):
     assert filtered[0].channel.alias == "second"
     assert await jobs.queue("empty") == []
     assert await jobs.queue("missing") is None
+    await engine.dispose()
+
+
+async def test_last_selected_channel_is_reused_and_can_be_changed(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'preferred-channel.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        default = Channel(alias="artwork", telegram_chat_id="-1001", title="Artwork", is_default=True)
+        arknights = Channel(alias="arknights", telegram_chat_id="-1002", title="Arknights")
+        session.add_all([user, default, arknights])
+        await session.flush()
+        user_id, default_id, arknights_id = user.id, default.id, arknights.id
+
+    jobs = JobService(sessions)
+    preferred = await jobs.get_preferred_channel(user_id, "artwork")
+    assert preferred is not None and preferred.id == default_id
+
+    post = SourcePost(
+        provider="direct", source_id="preferred", source_url="https://x/a.jpg",
+        normalized_url="https://x/a.jpg", title="A", author_name="Unknown",
+        author_url="https://x", media_items=[],
+    )
+    job = await jobs.create_preview(user_id, post, default_id, [], 3)
+    changed = await jobs.change_channel(job.id, arknights_id)
+    assert changed is not None and changed.alias == "arknights"
+
+    preferred = await jobs.get_preferred_channel(user_id, "artwork")
+    assert preferred is not None and preferred.id == arknights_id
+    await engine.dispose()
+
+
+async def test_disabled_last_selected_channel_falls_back_to_default(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'preferred-fallback.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        default = Channel(alias="artwork", telegram_chat_id="-1001", title="Artwork", is_default=True)
+        disabled = Channel(alias="old", telegram_chat_id="-1002", title="Old", is_enabled=False)
+        session.add_all([default, disabled])
+        await session.flush()
+        user = User(telegram_user_id=1, last_selected_channel_id=disabled.id)
+        session.add(user)
+        await session.flush()
+        user_id, default_id = user.id, default.id
+
+    preferred = await JobService(sessions).get_preferred_channel(user_id, "artwork")
+    assert preferred is not None and preferred.id == default_id
     await engine.dispose()

@@ -290,10 +290,26 @@ class JobService:
             job.status = JobStatus.QUEUED
             return True
 
-    async def queue(self, limit: int = 10) -> list[Job]:
+    async def queue(self, alias: str | None = None, limit: int = 50) -> list[Job] | None:
         async with self.sessions() as session:
+            channel_id: int | None = None
+            if alias:
+                channel_id = await session.scalar(
+                    select(Channel.id).where(Channel.alias == alias, Channel.is_enabled.is_(True))
+                )
+                if channel_id is None:
+                    return None
+            statement = (
+                select(Job)
+                .join(Channel, Job.target_channel_id == Channel.id)
+                .options(selectinload(Job.channel))
+                .where(Job.status.in_(ACTIVE_JOB_STATUSES), Channel.is_enabled.is_(True))
+            )
+            if channel_id is not None:
+                statement = statement.where(Job.target_channel_id == channel_id)
+            statement = statement.order_by(Channel.alias, Job.created_at, Job.id).limit(limit)
             return list(
-                (await session.scalars(select(Job).where(Job.status.in_(ACTIVE_JOB_STATUSES)).order_by(Job.created_at).limit(limit))).all()
+                (await session.scalars(statement)).all()
             )
 
     async def recent(self, limit: int = 10) -> list[Job]:

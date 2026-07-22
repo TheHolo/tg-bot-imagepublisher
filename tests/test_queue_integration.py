@@ -145,3 +145,39 @@ async def test_preview_without_id_reads_oldest_queued_job_without_changing_it(tm
     assert unchanged is not None and unchanged.status == JobStatus.QUEUED
     assert unchanged.force_publish is False
     await engine.dispose()
+
+
+async def test_queue_can_be_filtered_by_channel_alias(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'queue-alias.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        first = Channel(alias="first", telegram_chat_id="-1001", title="First", is_default=True)
+        second = Channel(alias="second", telegram_chat_id="-1002", title="Second")
+        empty = Channel(alias="empty", telegram_chat_id="-1003", title="Empty")
+        session.add_all([user, first, second, empty])
+        await session.flush()
+        session.add_all([
+            Job(
+                created_by_user_id=user.id, provider="direct", source_id="first-job",
+                source_url="https://x/first.jpg", normalized_url="https://x/first.jpg",
+                target_channel_id=first.id, status=JobStatus.QUEUED,
+                post_data={}, user_tags=[], source_tags=[],
+            ),
+            Job(
+                created_by_user_id=user.id, provider="direct", source_id="second-job",
+                source_url="https://x/second.jpg", normalized_url="https://x/second.jpg",
+                target_channel_id=second.id, status=JobStatus.QUEUED,
+                post_data={}, user_tags=[], source_tags=[],
+            ),
+        ])
+
+    jobs = JobService(sessions)
+    filtered = await jobs.queue("second")
+
+    assert filtered is not None and len(filtered) == 1
+    assert filtered[0].source_id == "second-job"
+    assert filtered[0].channel.alias == "second"
+    assert await jobs.queue("empty") == []
+    assert await jobs.queue("missing") is None
+    await engine.dispose()

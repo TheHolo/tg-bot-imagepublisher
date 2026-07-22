@@ -15,6 +15,7 @@ from app.services.preview_service import PreviewService
 from app.services.translation_service import TranslationService
 from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.durations import format_duration, parse_duration
+from app.utils.queue_schedule import estimate_queue_schedule, format_countdown
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def build_router(
         await message.answer(
             "Отправьте ссылку Pixiv или прямую ссылку на изображение и теги.\n"
             "Пример: https://www.pixiv.net/en/artworks/123 art landscape --channel artwork\n\n"
-            "Команды: /status ID, /queue, /preview [ID], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
+            "Команды: /status ID, /queue [ALIAS], /preview [ID], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
             "/channel_interval ALIAS INTERVAL, /providers, /stats, /health"
         )
 
@@ -111,12 +112,25 @@ def build_router(
         await message.answer(f"Задание #{job.id}: {job.status}" if job else "Задание не найдено.")
 
     @router.message(Command("queue"))
-    async def queue(message: Message) -> None:
-        rows = await jobs.queue()
+    async def queue(message: Message, command: CommandObject) -> None:
+        alias = (command.args or "").strip().lower() or None
+        if alias and len(alias.split()) != 1:
+            await message.answer("Использование: /queue [alias]")
+            return
+        rows = await jobs.queue(alias)
+        if rows is None:
+            await message.answer(f"Канал {escape(alias)} не найден или отключён.")
+            return
+        if not rows:
+            await message.answer(
+                f"Очередь канала {escape(alias)} пуста." if alias else "Очередь пуста."
+            )
+            return
         await message.answer("\n".join(
-            f"#{job.id} · {job.status} · {job.provider}{' · вручную' if job.force_publish else ''}"
-            for job in rows
-        ) or "Очередь пуста.")
+            f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {format_countdown(estimate)}"
+            f"{' · вручную' if job.force_publish else ''}"
+            for job, estimate in estimate_queue_schedule(rows)
+        ))
 
     @router.message(Command("publish"))
     async def publish_job(message: Message, command: CommandObject) -> None:

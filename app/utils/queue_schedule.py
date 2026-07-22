@@ -49,6 +49,22 @@ def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> lis
     return result
 
 
+def next_queued_by_schedule(
+    jobs: list[Job], now: datetime | None = None,
+) -> tuple[Job, datetime] | None:
+    """Return the queued job with the earliest estimated publication time."""
+    candidates = [
+        (job, estimate)
+        for job, estimate in estimate_queue_schedule(jobs, now)
+        if job.status == JobStatus.QUEUED
+    ]
+    return min(
+        candidates,
+        key=lambda item: (_aware_utc(item[1]), _aware_utc(item[0].created_at), item[0].id),
+        default=None,
+    )
+
+
 def format_countdown(target: datetime, now: datetime | None = None) -> str:
     now = _aware_utc(now or datetime.now(timezone.utc))
     seconds = max(0, round((_aware_utc(target) - now).total_seconds()))

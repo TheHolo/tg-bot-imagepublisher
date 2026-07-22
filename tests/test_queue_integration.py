@@ -7,6 +7,7 @@ from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
 from app.domain.models import SourcePost
 from app.services.job_service import JobService
+from app.utils.queue_schedule import next_queued_by_schedule
 
 
 async def test_claim_is_atomic(tmp_path):
@@ -140,8 +141,11 @@ async def test_preview_without_id_reads_oldest_queued_job_without_changing_it(tm
         older_id = older.id
 
     jobs = JobService(sessions)
-    previewed = await jobs.next_queued()
-    assert previewed is not None and previewed.id == older_id
+    rows = await jobs.queue(limit=None)
+    selected = next_queued_by_schedule(rows)
+    assert selected is not None
+    previewed = selected[0]
+    assert previewed.id == older_id
     unchanged = await jobs.get(older_id)
     assert unchanged is not None and unchanged.status == JobStatus.QUEUED
     assert unchanged.force_publish is False

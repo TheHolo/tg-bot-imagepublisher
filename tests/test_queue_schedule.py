@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.domain.enums import JobStatus
-from app.utils.queue_schedule import estimate_queue_schedule, format_countdown
+from app.utils.queue_schedule import estimate_queue_schedule, format_countdown, next_queued_by_schedule
 
 
 def make_job(job_id, channel, created_at, *, force=False, status=JobStatus.QUEUED):
@@ -56,3 +56,33 @@ def test_countdown_format():
     now = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
     assert format_countdown(now, now) == "сейчас"
     assert format_countdown(now + timedelta(hours=1, minutes=2, seconds=3), now) == "через 1ч 2м 3с"
+
+
+def test_next_queued_uses_earliest_estimated_time_across_channels():
+    now = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    arknights = SimpleNamespace(
+        alias="arknights", publish_interval_seconds=7200,
+        next_publish_at=now + timedelta(minutes=12),
+    )
+    spice_and_wolf = SimpleNamespace(
+        alias="spice_and_wolf", publish_interval_seconds=7200,
+        next_publish_at=now + timedelta(hours=2),
+    )
+    jobs = [
+        make_job(17, spice_and_wolf, now - timedelta(hours=1)),
+        make_job(28, arknights, now),
+    ]
+
+    selected = next_queued_by_schedule(jobs, now)
+
+    assert selected is not None
+    assert selected[0].id == 28
+    assert selected[1] == now + timedelta(minutes=12)
+
+
+def test_next_queued_returns_none_when_only_in_progress_jobs_exist():
+    now = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    channel = SimpleNamespace(alias="art", publish_interval_seconds=60, next_publish_at=None)
+    jobs = [make_job(1, channel, now, status=JobStatus.PUBLISHING)]
+
+    assert next_queued_by_schedule(jobs, now) is None

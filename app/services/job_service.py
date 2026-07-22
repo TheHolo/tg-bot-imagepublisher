@@ -132,21 +132,6 @@ class JobService:
                 select(Job).options(selectinload(Job.channel), selectinload(Job.media_items)).where(Job.id == job_id)
             )
 
-    async def next_queued(self) -> Job | None:
-        async with self.sessions() as session:
-            return await session.scalar(
-                select(Job)
-                .join(Channel, Job.target_channel_id == Channel.id)
-                .options(selectinload(Job.channel))
-                .where(
-                    Job.status == JobStatus.QUEUED,
-                    Job.cancel_requested.is_(False),
-                    Channel.is_enabled.is_(True),
-                )
-                .order_by(Job.created_at, Job.id)
-                .limit(1)
-            )
-
     async def transition(self, job_id: int, status: JobStatus, message: str | None = None) -> Job | None:
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
@@ -317,7 +302,7 @@ class JobService:
             job.status = JobStatus.QUEUED
             return True
 
-    async def queue(self, alias: str | None = None, limit: int = 50) -> list[Job] | None:
+    async def queue(self, alias: str | None = None, limit: int | None = 50) -> list[Job] | None:
         async with self.sessions() as session:
             channel_id: int | None = None
             if alias:
@@ -334,7 +319,9 @@ class JobService:
             )
             if channel_id is not None:
                 statement = statement.where(Job.target_channel_id == channel_id)
-            statement = statement.order_by(Channel.alias, Job.created_at, Job.id).limit(limit)
+            statement = statement.order_by(Channel.alias, Job.created_at, Job.id)
+            if limit is not None:
+                statement = statement.limit(limit)
             return list(
                 (await session.scalars(statement)).all()
             )

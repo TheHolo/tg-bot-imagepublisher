@@ -15,7 +15,7 @@ from app.services.preview_service import PreviewService
 from app.services.translation_service import TranslationService
 from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.durations import format_duration, parse_duration
-from app.utils.queue_schedule import estimate_queue_schedule, format_countdown
+from app.utils.queue_schedule import estimate_queue_schedule, format_countdown, next_queued_by_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def build_router(
         await message.answer(
             "Отправьте ссылку Pixiv или прямую ссылку на изображение и теги.\n"
             "Пример: https://www.pixiv.net/en/artworks/123 art landscape --channel artwork\n\n"
-            "Команды: /status ID, /queue [ALIAS], /preview [ID], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
+            "Команды: /status ID, /queue [ALIAS], /preview [ID|ALIAS], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
             "/channel_interval ALIAS INTERVAL, /providers, /stats, /health"
         )
 
@@ -173,13 +173,30 @@ def build_router(
 
     @router.message(Command("preview"))
     async def preview_job(message: Message, command: CommandObject) -> None:
-        if command.args and not command.args.isdigit():
-            await message.answer("Использование: /preview [job_id]")
+        argument = (command.args or "").strip().lower()
+        if argument and len(argument.split()) != 1:
+            await message.answer("Использование: /preview [job_id|alias]")
             return
-        job = await jobs.get(int(command.args)) if command.args else await jobs.next_queued()
+        estimate = None
+        if argument.isdigit():
+            job = await jobs.get(int(argument))
+        else:
+            alias = argument or None
+            rows = await jobs.queue(alias, limit=None)
+            if rows is None:
+                await message.answer(f"Канал {escape(alias)} не найден или отключён.")
+                return
+            scheduled = next_queued_by_schedule(rows)
+            job, estimate = scheduled if scheduled else (None, None)
         if not job:
             await message.answer(
-                "Задание не найдено." if command.args else "В очереди нет заданий для предпросмотра."
+                "Задание не найдено."
+                if argument.isdigit()
+                else (
+                    f"В очереди канала {escape(argument)} нет заданий для предпросмотра."
+                    if argument
+                    else "В очереди нет заданий для предпросмотра."
+                )
             )
             return
         if job.status != JobStatus.QUEUED:
@@ -191,7 +208,9 @@ def build_router(
             await message.answer(f"Не удалось подготовить предпросмотр задания #{job.id}: {error}")
             return
         await message.answer(
-            f"Предпросмотр задания #{job.id}. Очередь и интервал не изменены.",
+            f"Предпросмотр задания #{job.id} · {escape(job.channel.alias)}"
+            f"{' · ' + format_countdown(estimate) if estimate else ''}. "
+            "Очередь и интервал не изменены.",
             reply_markup=queued_preview_keyboard(job.id),
         )
 

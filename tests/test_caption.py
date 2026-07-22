@@ -61,3 +61,14 @@ def test_caption_is_shortened_without_cutting_html():
     assert len(caption) <= 256
     assert caption.count("<b>") == caption.count("</b>") == 1
     assert caption.count("<a ") == caption.count("</a>") == 2
+
+
+def test_caption_uses_deviantart_brand_spelling():
+    post = SourcePost(
+        provider="deviantart", source_id="1", source_url="https://x", normalized_url="https://x",
+        title="Title", author_name="Artist", author_url="https://x/artist", media_items=[],
+    )
+
+    caption = CaptionService().build(post, [])
+
+    assert "Оригинал на DeviantArt" in caption

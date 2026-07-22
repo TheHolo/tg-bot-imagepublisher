@@ -13,6 +13,7 @@ from app.config import Settings
 from app.db.models import Channel
 from app.db.session import create_database, create_schema
 from app.providers.direct_image import DirectImageProvider
+from app.providers.deviantart import DeviantArtProvider
 from app.providers.pixiv import PixivProvider
 from app.providers.registry import ProviderRegistry
 from app.queue.worker import WorkerPool
@@ -75,6 +76,7 @@ async def bootstrap(settings: Settings | None = None) -> Application:
             media_limit_enabled=settings.pixiv_media_limit_enabled,
             max_images=settings.pixiv_max_images,
         ),
+        DeviantArtProvider(http),
         DirectImageProvider(http, settings.max_download_bytes),
     ])
     jobs = JobService(sessions)

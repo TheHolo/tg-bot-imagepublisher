@@ -3,7 +3,7 @@ from html import escape
 from app.domain.exceptions import MediaValidationError
 from app.domain.models import SourcePost
 from app.utils.tags import hashtags
-from app.utils.text import shorten
+from app.utils.text import provider_label, shorten
 
 
 DEFAULT_TEMPLATE = (
@@ -27,7 +27,7 @@ class CaptionService:
         current_tags = list(tags)
 
         def render() -> str:
-            provider_name = post.provider.title()
+            provider_name = provider_label(post.provider)
             values = {
             "title": escape(title),
             "author_name": escape(post.author_name or "Неизвестный автор"),

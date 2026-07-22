@@ -16,6 +16,7 @@ from app.services.translation_service import TranslationService
 from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.durations import format_duration, parse_duration
 from app.utils.queue_schedule import estimate_queue_schedule, format_countdown, next_queued_by_schedule
+from app.utils.text import provider_label
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +464,7 @@ def build_router(
                     )
                     continue
                 await message.answer(
-                    prefix + f"Источник: {escape(post.provider.title())}\nАвтор: {escape(post.author_name)}\n"
+                    prefix + f"Источник: {escape(provider_label(post.provider))}\nАвтор: {escape(post.author_name)}\n"
                     f"Название: {escape(post.title)}\nФайлов: {len(post.media_items)}\nКанал: {escape(channel.alias)}\n\n"
                     f"Теги: {hashtags(combined_tags) or '—'}", reply_markup=preview_keyboard(job.id)
                 )

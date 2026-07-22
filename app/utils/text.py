@@ -3,6 +3,7 @@ from html import unescape
 from html.parser import HTMLParser
 
 _WHITESPACE = re.compile(r"\s+")
+_PROVIDER_LABELS = {"deviantart": "DeviantArt", "pixiv": "Pixiv"}
 
 
 class _TextExtractor(HTMLParser):
@@ -40,3 +41,7 @@ def shorten(value: str, limit: int = 240) -> str:
     if cut < len(value) and not value[cut].isspace() and " " in candidate:
         candidate = candidate.rsplit(" ", 1)[0]
     return candidate.rstrip(".,;:! ") + "…"
+
+
+def provider_label(value: str) -> str:
+    return _PROVIDER_LABELS.get(value.casefold(), value.title())

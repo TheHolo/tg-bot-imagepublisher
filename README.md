@@ -86,6 +86,15 @@ docker compose up -d --build
 
 Имя volume уточните командой `docker volume ls`. Без Docker скопируйте `data/database.db` после остановки сервиса. Пример systemd unit находится в `deploy/telegram-image-publisher.service`; замените пользователя и пути, затем выполните `systemctl daemon-reload && systemctl enable --now telegram-image-publisher`.
 
+Для обновления уже работающей systemd-установки используйте `deploy/update.sh`. Скрипт подтягивает текущую ветку только через fast-forward, делает резервную копию SQLite, обновляет зависимости и перезапускает сервис:
+
+```bash
+cd /opt/telegram-image-publisher/tg-bot-imagepublisher
+sudo ./deploy/update.sh
+```
+
+Если путь запускается без executable-флага, выполните `sudo bash deploy/update.sh`. Локальные изменения tracked-файлов намеренно блокируют автоматическое обновление; `.env`, база и storage Git не затрагивает.
+
 ## Тесты и диагностика
 
 ```bash

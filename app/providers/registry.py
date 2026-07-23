@@ -18,3 +18,7 @@ class ProviderRegistry:
     @property
     def names(self) -> list[str]:
         return [provider.name for provider in self._providers]
+
+    @property
+    def providers(self) -> tuple[BaseProvider, ...]:
+        return tuple(self._providers)

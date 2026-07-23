@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import shutil
+import time
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -22,6 +24,27 @@ from app.utils.tags import merge_tags
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class WorkerSnapshot:
+    index: int
+    alive: bool
+    job_id: int | None
+    channel_alias: str | None
+    stage: str | None
+    busy_seconds: float | None
+    heartbeat_age_seconds: float | None
+
+
+@dataclass
+class _WorkerRuntime:
+    index: int
+    last_heartbeat: float | None = None
+    job_id: int | None = None
+    channel_alias: str | None = None
+    stage: str | None = None
+    busy_since: float | None = None
+
+
 class WorkerPool:
     def __init__(
         self, *, bot: Bot, sessions: async_sessionmaker[AsyncSession], jobs: JobService,
@@ -38,10 +61,15 @@ class WorkerPool:
         self.auto_add_source_tags = auto_add_source_tags
         self.max_tags, self.max_tag_length = max_tags, max_tag_length
         self.tasks: list[asyncio.Task] = []
+        self._runtime = [_WorkerRuntime(index=index) for index in range(count)]
         self.stopping = False
 
     async def start(self) -> None:
         await self.jobs.recover()
+        self.stopping = False
+        now = time.monotonic()
+        for state in self._runtime:
+            state.last_heartbeat = now
         self.tasks = [asyncio.create_task(self._run(index), name=f"publisher-worker-{index}") for index in range(self.count)]
         self.wakeup.set()
 
@@ -53,6 +81,7 @@ class WorkerPool:
 
     async def _run(self, index: int) -> None:
         while not self.stopping:
+            self._heartbeat(index)
             try:
                 job = await self.jobs.claim_next()
             except asyncio.CancelledError:
@@ -62,12 +91,15 @@ class WorkerPool:
                 await asyncio.sleep(2)
                 continue
             if not job:
+                self._set_idle(index)
                 self.wakeup.clear()
                 try:
                     await asyncio.wait_for(self.wakeup.wait(), timeout=10)
                 except TimeoutError:
                     pass
                 continue
+            channel_alias = getattr(getattr(job, "channel", None), "alias", "unknown")
+            self._set_busy(index, job.id, channel_alias, JobStatus.DOWNLOADING)
             try:
                 await self._process(job)
             except asyncio.CancelledError:
@@ -79,21 +111,29 @@ class WorkerPool:
                 await self._notify(job, f"Задание #{job.id}: ошибка — {error}")
                 if retryable and job.attempts < job.max_attempts:
                     self.wakeup.set()
+            finally:
+                self._set_idle(index)
 
     async def _process(self, job: Job) -> None:
+        self._set_job_stage(job.id, JobStatus.RESOLVING)
         post = deserialize_post(job.post_data)
         await self.translator.enrich_title(post)
         duplicate = await self.jobs.duplicate(job)
         if duplicate and not job.allow_duplicate:
             raise DuplicatePublicationError(f"Эта публикация уже отправлена в канал {job.channel.alias}")
         downloaded = []
-        for item in post.media_items:
+        total_media = len(post.media_items)
+        for position, item in enumerate(post.media_items, start=1):
+            self._set_job_stage(job.id, f"{JobStatus.DOWNLOADING} {position}/{total_media}")
             if await self.jobs.is_cancelled(job.id):
                 await self.jobs.transition(job.id, JobStatus.CANCELLED)
                 return
             downloaded.append(await self.downloader.download(job.id, item))
         await self.jobs.transition(job.id, JobStatus.PROCESSING)
-        prepared = [await self.media.prepare(item, job.channel.publish_mode) for item in downloaded]
+        prepared = []
+        for position, downloaded_item in enumerate(downloaded, start=1):
+            self._set_job_stage(job.id, f"{JobStatus.PROCESSING} {position}/{total_media}")
+            prepared.append(await self.media.prepare(downloaded_item, job.channel.publish_mode))
         if await self.jobs.is_cancelled(job.id):
             await self.jobs.transition(job.id, JobStatus.CANCELLED)
             return
@@ -102,6 +142,7 @@ class WorkerPool:
             caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
         caption = self.captions.build(post, caption_tags, job.channel.caption_template or self.captions_template)
         await self.jobs.transition(job.id, JobStatus.PUBLISHING)
+        self._set_job_stage(job.id, JobStatus.PUBLISHING)
         result = await self.publisher.publish(job, post, prepared, job.channel, caption)
         async with self.sessions() as session, session.begin():
             session.add(Publication(
@@ -128,6 +169,51 @@ class WorkerPool:
         await self._notify(job, f"Задание #{job.id} успешно опубликовано в {job.channel.alias}.")
         if self.delete_after_publish:
             shutil.rmtree(self.storage / "jobs" / str(job.id), ignore_errors=True)
+
+    def snapshot(self) -> list[WorkerSnapshot]:
+        now = time.monotonic()
+        snapshots = []
+        for state in self._runtime:
+            task = self.tasks[state.index] if state.index < len(self.tasks) else None
+            snapshots.append(WorkerSnapshot(
+                index=state.index,
+                alive=task is not None and not task.done(),
+                job_id=state.job_id,
+                channel_alias=state.channel_alias,
+                stage=state.stage,
+                busy_seconds=now - state.busy_since if state.busy_since is not None else None,
+                heartbeat_age_seconds=(
+                    now - state.last_heartbeat if state.last_heartbeat is not None else None
+                ),
+            ))
+        return snapshots
+
+    def _heartbeat(self, index: int) -> None:
+        self._runtime[index].last_heartbeat = time.monotonic()
+
+    def _set_busy(self, index: int, job_id: int, channel_alias: str, stage: str) -> None:
+        state = self._runtime[index]
+        now = time.monotonic()
+        state.last_heartbeat = now
+        state.job_id = job_id
+        state.channel_alias = channel_alias
+        state.stage = str(stage)
+        state.busy_since = now
+
+    def _set_idle(self, index: int) -> None:
+        state = self._runtime[index]
+        state.last_heartbeat = time.monotonic()
+        state.job_id = None
+        state.channel_alias = None
+        state.stage = None
+        state.busy_since = None
+
+    def _set_job_stage(self, job_id: int, stage: str) -> None:
+        for state in self._runtime:
+            if state.job_id == job_id:
+                state.stage = str(stage)
+                state.last_heartbeat = time.monotonic()
+                return
 
     @property
     def captions_template(self) -> str:

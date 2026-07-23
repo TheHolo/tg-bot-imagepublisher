@@ -93,3 +93,21 @@ async def test_worker_honors_cancellation_after_media_preparation(tmp_path):
 
     assert jobs.transition.await_args_list[-1].args == (job.id, JobStatus.CANCELLED)
     pool.publisher.publish.assert_not_awaited()
+
+
+async def test_worker_snapshot_reports_only_current_job_as_busy():
+    pool = make_pool(SimpleNamespace())
+    waiting = asyncio.create_task(asyncio.Event().wait())
+    pool.tasks = [waiting]
+    pool._set_busy(0, 42, "artwork", "processing 1/2")
+
+    snapshot = pool.snapshot()[0]
+
+    assert snapshot.alive is True
+    assert snapshot.job_id == 42
+    assert snapshot.channel_alias == "artwork"
+    assert snapshot.stage == "processing 1/2"
+    assert snapshot.busy_seconds is not None
+
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)

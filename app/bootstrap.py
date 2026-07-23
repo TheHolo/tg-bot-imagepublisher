@@ -19,6 +19,7 @@ from app.providers.registry import ProviderRegistry
 from app.queue.worker import WorkerPool
 from app.services.caption_service import CaptionService
 from app.services.download_service import DownloadService
+from app.services.health_service import HealthService
 from app.services.ingest_service import IngestService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
@@ -94,12 +95,6 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
     )
     wakeup = asyncio.Event()
-    dispatcher = Dispatcher(storage=MemoryStorage())
-    middleware = AdminOnlyMiddleware(settings.admin_ids)
-    router = build_router(ingest, jobs, previews, translator, wakeup, registry, settings)
-    router.message.outer_middleware(middleware)
-    router.callback_query.outer_middleware(middleware)
-    dispatcher.include_router(router)
     workers = WorkerPool(
         bot=bot, sessions=sessions, jobs=jobs,
         downloader=downloader, media=media, captions=captions, publisher=publisher,
@@ -108,6 +103,16 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         auto_add_source_tags=settings.auto_add_source_tags,
         max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
     )
+    health = HealthService(
+        bot=bot, sessions=sessions, workers=workers, storage=settings.storage_path,
+        registry=registry, database_url=settings.database_url,
+    )
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    middleware = AdminOnlyMiddleware(settings.admin_ids)
+    router = build_router(ingest, jobs, previews, translator, health, wakeup, registry, settings)
+    router.message.outer_middleware(middleware)
+    router.callback_query.outer_middleware(middleware)
+    dispatcher.include_router(router)
     return Application(settings, bot, dispatcher, http, engine, workers)
 
 

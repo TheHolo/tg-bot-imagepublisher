@@ -11,6 +11,7 @@ from app.bot.states import EditPreview
 from app.domain.enums import JobStatus
 from app.domain.exceptions import ApplicationError
 from app.services.ingest_service import IngestService
+from app.services.health_service import HealthService, render_health_report
 from app.services.job_service import JobService
 from app.services.preview_service import PreviewService
 from app.services.translation_service import TranslationService
@@ -76,7 +77,7 @@ def queue_summary_line(post_count: int, completion: datetime, now: datetime) -> 
 
 def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
-    translator: TranslationService, wakeup, registry, settings,
+    translator: TranslationService, health: HealthService, wakeup, registry, settings,
 ) -> Router:
     router = Router()
 
@@ -91,7 +92,7 @@ def build_router(
             "Отправьте ссылку Pixiv или прямую ссылку на изображение и теги.\n"
             "Пример: https://www.pixiv.net/en/artworks/123 art landscape --channel artwork\n\n"
             "Команды: /status ID, /queue [ALIAS], /preview [ID|ALIAS], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
-            "/channel_interval ALIAS INTERVAL, /providers, /stats, /health"
+            "/channel_interval ALIAS INTERVAL, /providers, /stats, /health [full]"
         )
 
     @router.message(Command("providers"))
@@ -296,9 +297,13 @@ def build_router(
         await message.answer("\n".join(f"{key}: {value}" for key, value in sorted(values.items())) or "Заданий пока нет.")
 
     @router.message(Command("health"))
-    async def health(message: Message) -> None:
-        await jobs.stats()
-        await message.answer("База данных: OK\nWorker: OK\nTelegram API: OK")
+    async def health_status(message: Message, command: CommandObject) -> None:
+        argument = (command.args or "").strip().lower()
+        if argument not in {"", "full"}:
+            await message.answer("Использование: /health [full]")
+            return
+        report = await health.check(full=argument == "full")
+        await message.answer(render_health_report(report), parse_mode="HTML")
 
     @router.message(Command("cancel", "retry"))
     async def control(message: Message, command: CommandObject) -> None:

@@ -18,6 +18,8 @@ from app.utils.urls import validate_public_url
 class DeviantArtProvider(BaseProvider):
     name = "deviantart"
     _oembed_url = "https://backend.deviantart.com/oembed"
+    healthcheck_url = _oembed_url
+    healthcheck_statuses = frozenset({200, 400, 404})
     _path_re = re.compile(r"^/([^/]+)/art/([^/?#]+)-(\d+)/?$", re.IGNORECASE)
     _media_hosts = {"wixmp.com", "deviantart.net", "deviantart.com"}
 
@@ -125,6 +127,8 @@ def _parse_datetime(value: object) -> datetime | None:
 
 
 def _positive_int(value: object) -> int | None:
+    if not isinstance(value, (int, float, str)):
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError):

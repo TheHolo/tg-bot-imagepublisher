@@ -17,6 +17,7 @@ from app.providers.base import BaseProvider
 
 class PixivProvider(BaseProvider):
     name = "pixiv"
+    healthcheck_url = "https://www.pixiv.net/"
     _id_re = re.compile(r"/(?:en/)?artworks/(\d+)")
 
     def __init__(

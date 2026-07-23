@@ -52,7 +52,11 @@ class CaptionService:
             current_tags = []
             caption = render()
         while len(title) > 1 and len(caption) > self.limit:
-            title = title[: max(1, len(title) - (len(caption) - self.limit) - 1)].rstrip() + "…"
+            target_length = max(1, len(title) - (len(caption) - self.limit))
+            shortened_title = "…" if target_length == 1 else title[: target_length - 1].rstrip() + "…"
+            if shortened_title == title:
+                break
+            title = shortened_title
             caption = render()
         if len(caption) > self.limit:
             raise MediaValidationError("Обязательные поля подписи превышают лимит Telegram")

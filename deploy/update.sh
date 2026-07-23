@@ -4,6 +4,8 @@ set -Eeuo pipefail
 SERVICE_NAME="${SERVICE_NAME:-telegram-image-publisher}"
 APP_USER="${APP_USER:-telegram-publisher}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
+APP_ROOT="${APP_ROOT:-/opt/telegram-image-publisher}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -45,6 +47,8 @@ id "${APP_USER}" >/dev/null 2>&1 || fail "System user ${APP_USER} does not exist
 systemctl cat "${SERVICE_NAME}" >/dev/null 2>&1 || fail "Service ${SERVICE_NAME} is not installed"
 [[ -x "${VENV_PYTHON}" ]] || fail "Virtual environment not found: ${VENV_PYTHON}"
 [[ -d "${PROJECT_DIR}/.git" ]] || fail "Git repository not found: ${PROJECT_DIR}"
+[[ "${PROJECT_DIR}" == "${APP_ROOT}" ]] \
+    || fail "Repository must be installed directly in ${APP_ROOT}; found ${PROJECT_DIR}"
 
 exec 9>"${LOCK_FILE}"
 flock -n 9 || fail "Another update is already running"
@@ -53,13 +57,15 @@ cd "${PROJECT_DIR}"
 
 branch="$(as_app git branch --show-current)"
 [[ -n "${branch}" ]] || fail "Detached HEAD is not supported"
+[[ "${branch}" == "${DEPLOY_BRANCH}" ]] \
+    || fail "Expected branch ${DEPLOY_BRANCH}, but repository is on ${branch}"
 
 dirty="$(as_app git status --porcelain --untracked-files=no)"
 [[ -z "${dirty}" ]] || fail "Tracked files have local changes. Commit or discard them before updating."
 
-log "Fetching ${GIT_REMOTE}/${branch}"
-as_app git fetch "${GIT_REMOTE}" "${branch}"
-as_app git merge-base --is-ancestor HEAD "${GIT_REMOTE}/${branch}" \
+log "Fetching ${GIT_REMOTE}/${DEPLOY_BRANCH}"
+as_app git fetch "${GIT_REMOTE}" "${DEPLOY_BRANCH}"
+as_app git merge-base --is-ancestor HEAD "${GIT_REMOTE}/${DEPLOY_BRANCH}" \
     || fail "The remote branch cannot be applied as a fast-forward update"
 
 log "Stopping ${SERVICE_NAME}"
@@ -74,8 +80,8 @@ if [[ -f "${DATABASE_FILE}" ]]; then
     log "Database backup created: ${backup_file}"
 fi
 
-log "Updating ${branch}"
-as_app git merge --ff-only "${GIT_REMOTE}/${branch}"
+log "Updating ${DEPLOY_BRANCH}"
+as_app git merge --ff-only "${GIT_REMOTE}/${DEPLOY_BRANCH}"
 
 log "Installing project dependencies"
 as_app "${VENV_PYTHON}" -m pip install -e "${PROJECT_DIR}"

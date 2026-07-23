@@ -47,7 +47,10 @@ class TooManyMediaError(MediaValidationError):
 
 class PublishError(ApplicationError):
     code = "publish_error"
-    retryable = True
+
+
+class UncertainPublishError(PublishError):
+    code = "uncertain_publish"
 
 
 class ChannelPermissionError(PublishError):

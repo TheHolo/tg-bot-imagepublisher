@@ -3,6 +3,7 @@ from datetime import timedelta
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql import ColumnElement
 
 from app.db.models import Channel, Job, JobEvent, Publication, User, utcnow
 from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
@@ -143,6 +144,7 @@ class JobService:
                 job.started_at = utcnow()
             if status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
                 job.finished_at = utcnow()
+                await self._release_channel(session, job)
             session.add(JobEvent(job_id=job_id, event_type="status", old_status=old, new_status=status, message=message))
             return job
 
@@ -160,35 +162,56 @@ class JobService:
 
     async def claim_next(self) -> Job | None:
         async with self.sessions() as session, session.begin():
-            candidate = (
-                select(Job.id)
-                .join(Channel, Job.target_channel_id == Channel.id)
-                .where(
-                    Job.status == JobStatus.QUEUED,
-                    Job.cancel_requested.is_(False),
-                    or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= utcnow()),
-                    Channel.is_enabled.is_(True),
-                    or_(
-                        Job.force_publish.is_(True),
-                        Channel.next_publish_at.is_(None),
-                        Channel.next_publish_at <= utcnow(),
-                    ),
+            while True:
+                candidate = await session.execute(
+                    select(Job.id, Job.target_channel_id)
+                    .join(Channel, Job.target_channel_id == Channel.id)
+                    .where(
+                        Job.status == JobStatus.QUEUED,
+                        Job.cancel_requested.is_(False),
+                        or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= utcnow()),
+                        Channel.is_enabled.is_(True),
+                        Channel.active_job_id.is_(None),
+                        or_(
+                            Job.force_publish.is_(True),
+                            Channel.next_publish_at.is_(None),
+                            Channel.next_publish_at <= utcnow(),
+                        ),
+                    )
+                    .order_by(Job.force_publish.desc(), Job.created_at, Job.id)
+                    .limit(1)
                 )
-                .order_by(Job.force_publish.desc(), Job.created_at)
-                .limit(1)
-            )
-            claimed_id = await session.scalar(
-                update(Job)
-                .where(Job.id == candidate.scalar_subquery(), Job.status == JobStatus.QUEUED)
-                .values(
-                    status=JobStatus.DOWNLOADING, attempts=Job.attempts + 1,
-                    started_at=func.coalesce(Job.started_at, utcnow()), next_attempt_at=None,
+                row = candidate.first()
+                if row is None:
+                    return None
+                candidate_id, channel_id = row
+                reserved_channel_id = await session.scalar(
+                    update(Channel)
+                    .where(Channel.id == channel_id, Channel.active_job_id.is_(None))
+                    .values(active_job_id=candidate_id)
+                    .returning(Channel.id)
                 )
-                .returning(Job.id)
-            )
-            if claimed_id is None:
-                return None
-            return await session.scalar(select(Job).options(selectinload(Job.channel)).where(Job.id == claimed_id))
+                if reserved_channel_id is None:
+                    continue
+                claimed_id = await session.scalar(
+                    update(Job)
+                    .where(Job.id == candidate_id, Job.status == JobStatus.QUEUED)
+                    .values(
+                        status=JobStatus.DOWNLOADING, attempts=Job.attempts + 1,
+                        started_at=func.coalesce(Job.started_at, utcnow()), next_attempt_at=None,
+                    )
+                    .returning(Job.id)
+                )
+                if claimed_id is None:
+                    await session.execute(
+                        update(Channel)
+                        .where(Channel.id == channel_id, Channel.active_job_id == candidate_id)
+                        .values(active_job_id=None)
+                    )
+                    continue
+                return await session.scalar(
+                    select(Job).options(selectinload(Job.channel)).where(Job.id == claimed_id)
+                )
 
     async def force_publish(self, job_id: int) -> Job | None:
         async with self.sessions() as session, session.begin():
@@ -224,6 +247,8 @@ class JobService:
             if forced_id is None:
                 return None
             job = await session.get(Job, forced_id)
+            if job is None:
+                return None
             session.add(JobEvent(
                 job_id=job.id, event_type="manual_publish", old_status=job.status,
                 new_status=job.status, message="Manual publication requested for next queued job",
@@ -260,6 +285,7 @@ class JobService:
                 job.next_attempt_at = utcnow() + timedelta(seconds=delays[min(job.attempts - 1, len(delays) - 1)])
             if job.status == JobStatus.FAILED:
                 job.finished_at = utcnow()
+            await self._release_channel(session, job)
 
     async def change_channel(self, job_id: int, channel_id: int) -> Channel | None:
         async with self.sessions() as session, session.begin():
@@ -351,18 +377,68 @@ class JobService:
             rows = (await session.execute(select(Job.status, func.count(Job.id)).group_by(Job.status))).all()
             return {str(status): count for status, count in rows}
 
-    async def recover(self, stale_minutes: int = 15) -> int:
-        cutoff = utcnow() - timedelta(minutes=stale_minutes)
+    async def recover(self, stale_minutes: int | None = None) -> int:
+        processing_conditions: list[ColumnElement[bool]] = [
+            Job.status.in_({JobStatus.DOWNLOADING, JobStatus.PROCESSING})
+        ]
+        publishing_conditions: list[ColumnElement[bool]] = [Job.status == JobStatus.PUBLISHING]
+        if stale_minutes is not None:
+            cutoff = utcnow() - timedelta(minutes=stale_minutes)
+            processing_conditions.append(Job.updated_at < cutoff)
+            publishing_conditions.append(Job.updated_at < cutoff)
         async with self.sessions() as session, session.begin():
-            result = await session.execute(
+            cancelled_result = await session.execute(
                 update(Job)
-                .where(Job.status.in_({JobStatus.DOWNLOADING, JobStatus.PROCESSING}), Job.updated_at < cutoff)
-                .values(status=JobStatus.QUEUED, error_message="Recovered after restart")
+                .where(*processing_conditions, Job.cancel_requested.is_(True))
+                .values(
+                    status=JobStatus.CANCELLED,
+                    error_code=None,
+                    error_message="Cancelled during restart recovery",
+                    finished_at=utcnow(),
+                    next_attempt_at=None,
+                )
+                .returning(Job.id)
+            )
+            recovered_result = await session.execute(
+                update(Job)
+                .where(*processing_conditions, Job.cancel_requested.is_(False))
+                .values(
+                    status=JobStatus.QUEUED,
+                    error_code="recovered_after_restart",
+                    error_message="Recovered after restart",
+                    next_attempt_at=None,
+                )
+                .returning(Job.id)
             )
             # Publishing is deliberately not replayed automatically: that could duplicate posts.
-            await session.execute(
+            uncertain_result = await session.execute(
                 update(Job)
-                .where(Job.status == JobStatus.PUBLISHING, Job.updated_at < cutoff)
-                .values(status=JobStatus.FAILED, error_code="uncertain_publish", error_message="Проверьте канал перед повтором")
+                .where(*publishing_conditions)
+                .values(
+                    status=JobStatus.FAILED,
+                    error_code="uncertain_publish",
+                    error_message="Проверьте канал перед повтором",
+                    finished_at=utcnow(),
+                )
+                .returning(Job.id)
             )
-            return result.rowcount
+            affected_ids = [
+                *cancelled_result.scalars(),
+                *recovered_result.scalars(),
+                *uncertain_result.scalars(),
+            ]
+            if affected_ids:
+                await session.execute(
+                    update(Channel)
+                    .where(Channel.active_job_id.in_(affected_ids))
+                    .values(active_job_id=None)
+                )
+            return len(affected_ids)
+
+    @staticmethod
+    async def _release_channel(session: AsyncSession, job: Job) -> None:
+        await session.execute(
+            update(Channel)
+            .where(Channel.id == job.target_channel_id, Channel.active_job_id == job.id)
+            .values(active_job_id=None)
+        )

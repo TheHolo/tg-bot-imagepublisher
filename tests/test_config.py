@@ -38,3 +38,23 @@ def test_repository_settings_reject_secrets(tmp_path):
         assert "секретные параметры" in str(error)
     else:
         raise AssertionError("A secret in bot-settings.toml must be rejected")
+
+
+def test_env_file_accepts_single_quoted_channel_json(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join([
+            "BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI",
+            "ADMIN_IDS=123456789",
+            "DEFAULT_CHANNEL_ALIAS=artwork",
+            'CHANNELS_JSON=\'{"artwork":{"chat_id":"-1001234567890","publish_mode":"auto"}}\'',
+        ]),
+        encoding="utf-8",
+    )
+    for name in ("BOT_TOKEN", "ADMIN_IDS", "DEFAULT_CHANNEL_ALIAS", "CHANNELS_JSON"):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings(_config_file=tmp_path / "missing.toml", _env_file=env_file)
+
+    assert settings.default_channel_alias == "artwork"
+    assert settings.channels_json["artwork"]["chat_id"] == "-1001234567890"

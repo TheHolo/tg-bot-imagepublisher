@@ -14,13 +14,13 @@ dependencies = [
   "SQLAlchemy>=2.0,<3",
   "aiosqlite>=0.20,<1",
   "pydantic-settings>=2.5,<3",
-  "Pillow>=10.4,<12",
+  "Pillow>=12.3,<13",
 ]
 
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29,<1"]
 proxy = ["aiohttp-socks>=0.9,<1"]
-dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.24,<1"]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=1.0,<2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

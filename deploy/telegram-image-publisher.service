@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=simple
 User=telegram-publisher
 WorkingDirectory=/opt/telegram-image-publisher
-EnvironmentFile=/opt/telegram-image-publisher/.env
 ExecStart=/opt/telegram-image-publisher/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5

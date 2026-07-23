@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     worker_count: int = Field(1, ge=1, le=8)
     max_job_attempts: int = Field(3, ge=1, le=10)
     download_timeout: int = Field(60, ge=5)
-    max_download_size_mb: int = Field(100, ge=1)
+    max_download_size_mb: int = Field(47, ge=1, le=47)
     max_tags: int = Field(20, ge=1)
     max_tag_length: int = Field(64, ge=1)
     max_urls_per_message: int = Field(10, ge=1, le=50)
@@ -76,12 +76,27 @@ class Settings(BaseSettings):
     def parse_admin_ids(cls, value: object) -> set[int]:
         if isinstance(value, str):
             return {int(item.strip()) for item in value.split(",") if item.strip()}
-        return set(value or [])
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return {int(item) for item in value}
+        raise ValueError("admin_ids must be a comma-separated string or a collection")
 
     @field_validator("channels_json", mode="before")
     @classmethod
     def parse_channels(cls, value: object) -> dict[str, dict[str, Any]]:
-        return json.loads(value) if isinstance(value, str) else dict(value or {})
+        parsed: object = json.loads(value) if isinstance(value, str) else value
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise ValueError("channels_json must be a JSON object")
+
+        channels: dict[str, dict[str, Any]] = {}
+        for alias, settings in parsed.items():
+            if not isinstance(alias, str) or not isinstance(settings, dict):
+                raise ValueError("each channel must have a string alias and an object value")
+            channels[alias] = settings
+        return channels
 
     @property
     def max_download_bytes(self) -> int:

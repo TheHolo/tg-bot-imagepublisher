@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 
+import pytest
+
+from app.domain.exceptions import MediaValidationError
 from app.domain.models import SourcePost
 from app.services.caption_service import CaptionService
 
@@ -72,3 +75,14 @@ def test_caption_uses_deviantart_brand_spelling():
     caption = CaptionService().build(post, [])
 
     assert "Оригинал на DeviantArt" in caption
+
+
+def test_caption_with_oversized_required_fields_fails_instead_of_looping():
+    post = SourcePost(
+        provider="direct", source_id="1", source_url="https://x/image.jpg",
+        normalized_url="https://x/" + "a" * 500, title="Title",
+        author_name="Source", author_url="https://x", media_items=[],
+    )
+
+    with pytest.raises(MediaValidationError, match="Обязательные поля"):
+        CaptionService(limit=128).build(post, [])

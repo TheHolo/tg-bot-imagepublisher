@@ -20,7 +20,6 @@ from app.services.translation_service import TranslationService
 from app.utils.tags import merge_tags
 
 logger = logging.getLogger(__name__)
-RETRY_DELAYS = (5, 30, 120)
 
 
 class WorkerPool:
@@ -54,7 +53,14 @@ class WorkerPool:
 
     async def _run(self, index: int) -> None:
         while not self.stopping:
-            job = await self.jobs.claim_next()
+            try:
+                job = await self.jobs.claim_next()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("worker_claim_failed worker=%s", index)
+                await asyncio.sleep(2)
+                continue
             if not job:
                 self.wakeup.clear()
                 try:
@@ -72,7 +78,6 @@ class WorkerPool:
                 logger.exception("job_failed job_id=%s provider=%s attempt=%s", job.id, job.provider, job.attempts)
                 await self._notify(job, f"Задание #{job.id}: ошибка — {error}")
                 if retryable and job.attempts < job.max_attempts:
-                    await asyncio.sleep(RETRY_DELAYS[min(job.attempts - 1, len(RETRY_DELAYS) - 1)])
                     self.wakeup.set()
 
     async def _process(self, job: Job) -> None:
@@ -89,6 +94,9 @@ class WorkerPool:
             downloaded.append(await self.downloader.download(job.id, item))
         await self.jobs.transition(job.id, JobStatus.PROCESSING)
         prepared = [await self.media.prepare(item, job.channel.publish_mode) for item in downloaded]
+        if await self.jobs.is_cancelled(job.id):
+            await self.jobs.transition(job.id, JobStatus.CANCELLED)
+            return
         caption_tags = job.user_tags
         if self.auto_add_source_tags:
             caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)

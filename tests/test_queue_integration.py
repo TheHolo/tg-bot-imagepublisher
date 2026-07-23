@@ -32,6 +32,39 @@ async def test_claim_is_atomic(tmp_path):
     await engine.dispose()
 
 
+async def test_only_one_job_per_channel_can_be_active(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'channel-lease.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(
+            alias="main", telegram_chat_id="-1001", title="Main",
+            publish_interval_seconds=900,
+        )
+        session.add_all([user, channel])
+        await session.flush()
+        common = {
+            "created_by_user_id": user.id, "provider": "direct",
+            "source_url": "https://x/a.jpg", "normalized_url": "https://x/a.jpg",
+            "target_channel_id": channel.id, "status": JobStatus.QUEUED,
+            "post_data": {}, "user_tags": [], "source_tags": [],
+        }
+        session.add_all([
+            Job(source_id="first", **common),
+            Job(source_id="second", **common),
+        ])
+
+    jobs = JobService(sessions)
+    first = await jobs.claim_next()
+    assert first is not None
+    assert await jobs.claim_next() is None
+
+    await jobs.transition(first.id, JobStatus.COMPLETED)
+    second = await jobs.claim_next()
+    assert second is not None and second.id != first.id
+    await engine.dispose()
+
+
 async def test_job_waits_for_its_channel_interval(tmp_path):
     engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'delayed.db'}")
     await create_schema(engine)

@@ -38,6 +38,7 @@ class Channel(Base):
     publish_mode: Mapped[str] = mapped_column(String(16), default="auto")
     publish_interval_seconds: Mapped[int] = mapped_column(Integer, default=0)
     next_publish_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    active_job_id: Mapped[int | None] = mapped_column(Integer, index=True)
     caption_template: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

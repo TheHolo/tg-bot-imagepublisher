@@ -4,8 +4,6 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-import aiohttp
-
 from app.domain.exceptions import (
     InvalidUrlError,
     SourceAccessDeniedError,

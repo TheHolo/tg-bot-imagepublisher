@@ -3,10 +3,32 @@ from datetime import datetime, timezone
 from html import escape
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.bot.menu import (
+    BACK_CALLBACK,
+    CHANNEL_CALLBACK_PREFIX,
+    CHANNELS_BUTTON,
+    HEALTH_BUTTON,
+    HEALTH_CALLBACK_PREFIX,
+    HELP_BUTTON,
+    MAIN_MENU_TEXT,
+    PREVIEW_BUTTON,
+    PREVIEW_CALLBACK_PREFIX,
+    QUEUE_BUTTON,
+    QUEUE_CALLBACK_PREFIX,
+    STATS_BUTTON,
+    back_menu_keyboard,
+    channels_menu_keyboard,
+    health_menu_keyboard,
+    main_menu_keyboard,
+    preview_menu_keyboard,
+    queue_menu_keyboard,
+    render_help,
+)
 from app.bot.states import EditPreview
 from app.domain.enums import JobStatus
 from app.domain.exceptions import ApplicationError
@@ -86,14 +108,40 @@ def build_router(
             return user_tags
         return merge_tags(user_tags, source_tags, settings.max_tags, settings.max_tag_length)
 
-    @router.message(Command("start", "help"))
-    async def help_message(message: Message) -> None:
+    async def menu_callback_message(callback: CallbackQuery) -> Message | None:
+        if isinstance(callback.message, Message):
+            return callback.message
+        await callback.answer("Сообщение меню больше недоступно.", show_alert=True)
+        return None
+
+    @router.message(Command("start", "menu"))
+    async def main_menu(message: Message) -> None:
+        await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
+
+    async def show_help(message: Message) -> None:
         await message.answer(
-            "Отправьте ссылку Pixiv или прямую ссылку на изображение и теги.\n"
-            "Пример: https://www.pixiv.net/en/artworks/123 art landscape --channel artwork\n\n"
-            "Команды: /status ID, /queue [ALIAS], /preview [ID|ALIAS], /publish [ID], /cancel ID, /retry ID, /recent, /channels, "
-            "/channel_interval ALIAS INTERVAL, /providers, /stats, /health [full]"
+            render_help(), parse_mode="HTML", reply_markup=back_menu_keyboard(),
         )
+
+    @router.message(Command("help"))
+    async def help_command(message: Message) -> None:
+        await show_help(message)
+
+    @router.message(F.text == HELP_BUTTON)
+    async def help_button(message: Message) -> None:
+        await show_help(message)
+
+    @router.callback_query(F.data == BACK_CALLBACK)
+    async def return_to_main_menu(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None:
+            return
+        await callback.answer()
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
 
     @router.message(Command("providers"))
     async def providers(message: Message) -> None:
@@ -107,6 +155,18 @@ def build_router(
             f"интервал: {format_duration(item.publish_interval_seconds)}"
             for item in rows
         ) or "Каналы не настроены.")
+
+    @router.message(F.text == CHANNELS_BUTTON)
+    async def channels_button(message: Message) -> None:
+        rows = await jobs.channels()
+        await message.answer(
+            "📡 Зарегистрированные каналы\n🟢 активен · ⚪ отключён",
+            reply_markup=channels_menu_keyboard(rows),
+        )
+
+    @router.callback_query(F.data.startswith(CHANNEL_CALLBACK_PREFIX))
+    async def registered_channel_noop(callback: CallbackQuery) -> None:
+        await callback.answer()
 
     @router.message(Command("channel_interval"))
     async def channel_interval(message: Message, command: CommandObject) -> None:
@@ -135,24 +195,18 @@ def build_router(
         job = await jobs.get(int(command.args))
         await message.answer(f"Задание #{job.id}: {job.status}" if job else "Задание не найдено.")
 
-    @router.message(Command("queue"))
-    async def queue(message: Message, command: CommandObject) -> None:
-        alias = (command.args or "").strip().lower() or None
-        if alias and len(alias.split()) != 1:
-            await message.answer("Использование: /queue [alias]")
-            return
+    async def queue_text(alias: str | None) -> str:
         # The display limit must be applied after schedules from all channels
         # are merged. Limiting the database query here can hide whole channels
         # because JobService.queue orders rows by channel alias.
         rows = await jobs.queue(alias, limit=None)
         if rows is None:
-            await message.answer(f"Канал {escape(alias)} не найден или отключён.")
-            return
+            return f"Канал {escape(alias or '')} не найден или отключён."
         if not rows:
-            await message.answer(
-                f"Очередь канала {escape(alias)} пуста." if alias else "Очередь пуста."
+            return (
+                f"Очередь канала {escape(alias)} пуста."
+                if alias else "Очередь пуста."
             )
-            return
         now = datetime.now(timezone.utc)
         schedule = estimate_queue_schedule(rows, now)
         lines = [
@@ -162,13 +216,54 @@ def build_router(
         ]
         if alias:
             completion = max(estimate for _, estimate in schedule)
-            lines.insert(
-                0,
-                queue_summary_line(len(rows), completion, now),
-            )
+            lines.insert(0, queue_summary_line(len(rows), completion, now))
         if len(schedule) > 50:
             lines.append(f"…показаны ближайшие 50 из {len(schedule)} заданий.")
-        await message.answer("\n".join(lines))
+        return "\n".join(lines)
+
+    @router.message(Command("queue"))
+    async def queue(message: Message, command: CommandObject) -> None:
+        alias = (command.args or "").strip().lower() or None
+        if alias and len(alias.split()) != 1:
+            await message.answer("Использование: /queue [alias]")
+            return
+        await message.answer(await queue_text(alias))
+
+    @router.message(F.text == QUEUE_BUTTON)
+    async def queue_button(message: Message) -> None:
+        channels = await jobs.channels()
+        await message.answer(
+            "📋 Выберите общую очередь или активный канал:",
+            reply_markup=queue_menu_keyboard(channels),
+        )
+
+    @router.callback_query(F.data.startswith(QUEUE_CALLBACK_PREFIX))
+    async def queue_menu_selection(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        selection = callback.data.removeprefix(QUEUE_CALLBACK_PREFIX)
+        channels = await jobs.channels()
+        alias = None
+        if selection != "all":
+            if not selection.isdigit():
+                await callback.answer("Некорректный пункт меню.", show_alert=True)
+                return
+            channel = next(
+                (item for item in channels if item.id == int(selection) and item.is_enabled),
+                None,
+            )
+            if channel is None:
+                await callback.answer("Канал удалён или отключён.", show_alert=True)
+                return
+            alias = channel.alias
+        await callback.answer()
+        text = await queue_text(alias)
+        try:
+            await message.edit_text(text, reply_markup=queue_menu_keyboard(channels))
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
 
     @router.message(Command("publish"))
     async def publish_job(message: Message, command: CommandObject) -> None:
@@ -192,9 +287,7 @@ def build_router(
             "После публикации интервал канала начнётся заново."
         )
 
-    @router.message(Command("preview"))
-    async def preview_job(message: Message, command: CommandObject) -> None:
-        argument = (command.args or "").strip().lower()
+    async def show_preview(message: Message, argument: str) -> None:
         if argument and len(argument.split()) != 1:
             await message.answer("Использование: /preview [job_id|alias]")
             return
@@ -205,7 +298,7 @@ def build_router(
             alias = argument or None
             rows = await jobs.queue(alias, limit=None)
             if rows is None:
-                await message.answer(f"Канал {escape(alias)} не найден или отключён.")
+                await message.answer(f"Канал {escape(alias or '')} не найден или отключён.")
                 return
             scheduled = next_queued_by_schedule(rows)
             job, estimate = scheduled if scheduled else (None, None)
@@ -234,6 +327,43 @@ def build_router(
             "Очередь и интервал не изменены.",
             reply_markup=queued_preview_keyboard(job.id),
         )
+
+    @router.message(Command("preview"))
+    async def preview_job(message: Message, command: CommandObject) -> None:
+        await show_preview(message, (command.args or "").strip().lower())
+
+    @router.message(F.text == PREVIEW_BUTTON)
+    async def preview_button(message: Message) -> None:
+        channels = await jobs.channels()
+        await message.answer(
+            "🖼 Выберите активный канал или ближайший пост во всей очереди:",
+            reply_markup=preview_menu_keyboard(channels),
+        )
+
+    @router.callback_query(F.data.startswith(PREVIEW_CALLBACK_PREFIX))
+    async def preview_menu_selection(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        selection = callback.data.removeprefix(PREVIEW_CALLBACK_PREFIX)
+        argument = ""
+        if selection != "next":
+            if not selection.isdigit():
+                await callback.answer("Некорректный пункт меню.", show_alert=True)
+                return
+            channels = await jobs.channels()
+            channel = next(
+                (item for item in channels if item.id == int(selection) and item.is_enabled),
+                None,
+            )
+            if channel is None:
+                await callback.answer("Канал удалён или отключён.", show_alert=True)
+                return
+            argument = channel.alias
+        await callback.answer("Подготавливаю предпросмотр…")
+        target = f"канал {argument}" if argument else "вся очередь"
+        await message.edit_text(f"⏳ Ищу ближайший пост · {target}")
+        await show_preview(message, argument)
 
     @router.callback_query(F.data.startswith("preview_publish:"))
     async def publish_from_preview(callback: CallbackQuery, state: FSMContext) -> None:
@@ -291,10 +421,25 @@ def build_router(
         rows = await jobs.recent()
         await message.answer("\n".join(f"#{job.id} · {job.status} · {job.provider}" for job in rows) or "История пуста.")
 
-    @router.message(Command("stats"))
-    async def stats(message: Message) -> None:
+    async def show_stats(message: Message) -> None:
         values = await jobs.stats()
         await message.answer("\n".join(f"{key}: {value}" for key, value in sorted(values.items())) or "Заданий пока нет.")
+
+    @router.message(Command("stats"))
+    async def stats(message: Message) -> None:
+        await show_stats(message)
+
+    @router.message(F.text == STATS_BUTTON)
+    async def stats_button(message: Message) -> None:
+        await show_stats(message)
+
+    async def show_health(message: Message, *, full: bool) -> None:
+        report = await health.check(full=full)
+        await message.answer(
+            render_health_report(report),
+            parse_mode="HTML",
+            reply_markup=health_menu_keyboard(),
+        )
 
     @router.message(Command("health"))
     async def health_status(message: Message, command: CommandObject) -> None:
@@ -302,8 +447,35 @@ def build_router(
         if argument not in {"", "full"}:
             await message.answer("Использование: /health [full]")
             return
-        report = await health.check(full=argument == "full")
-        await message.answer(render_health_report(report), parse_mode="HTML")
+        await show_health(message, full=argument == "full")
+
+    @router.message(F.text == HEALTH_BUTTON)
+    async def health_button(message: Message) -> None:
+        await show_health(message, full=False)
+
+    @router.callback_query(F.data.startswith(HEALTH_CALLBACK_PREFIX))
+    async def health_menu_selection(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        selection = callback.data.removeprefix(HEALTH_CALLBACK_PREFIX)
+        if selection not in {"refresh", "full"}:
+            await callback.answer("Некорректный пункт меню.", show_alert=True)
+            return
+        full = selection == "full"
+        await callback.answer("Выполняю полную проверку…" if full else "Обновляю…")
+        if full:
+            await message.edit_text("⏳ Выполняю полную проверку здоровья бота…")
+        report = await health.check(full=full)
+        try:
+            await message.edit_text(
+                render_health_report(report),
+                parse_mode="HTML",
+                reply_markup=health_menu_keyboard(),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
 
     @router.message(Command("cancel", "retry"))
     async def control(message: Message, command: CommandObject) -> None:

@@ -1,0 +1,332 @@
+import ast
+from datetime import datetime, timezone
+from html import escape
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, MenuButtonCommands, Message, User
+
+from app.bot.menu import (
+    BACK_CALLBACK,
+    CHANNELS_BUTTON,
+    COMMAND_CATALOG,
+    HEALTH_BUTTON,
+    HELP_BUTTON,
+    PREVIEW_BUTTON,
+    QUEUE_BUTTON,
+    STATS_BUTTON,
+    bot_commands,
+    channels_menu_keyboard,
+    configure_bot_ui,
+    health_menu_keyboard,
+    main_menu_keyboard,
+    preview_menu_keyboard,
+    queue_menu_keyboard,
+    render_help,
+)
+from app.bot.router import build_router
+from app.db.models import Channel
+from app.services.health_service import HealthReport
+
+
+def make_channels() -> list[Channel]:
+    return [
+        Channel(
+            id=7, alias="artwork", telegram_chat_id="-1001",
+            title="Artwork", is_enabled=True,
+        ),
+        Channel(
+            id=8, alias="archive", telegram_chat_id="-1002",
+            title="Archive", is_enabled=False,
+        ),
+    ]
+
+
+def flatten(markup) -> list:
+    return [button for row in markup.inline_keyboard for button in row]
+
+
+class RecordingBot:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def __call__(self, method, request_timeout=None):
+        self.requests.append(method)
+        return True
+
+
+def make_message(bot: RecordingBot, text: str = "menu") -> Message:
+    return Message(
+        message_id=10,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=1, is_bot=False, first_name="Admin"),
+        text=text,
+    ).as_(bot)
+
+
+def make_callback(bot: RecordingBot, message: Message, data: str) -> CallbackQuery:
+    return CallbackQuery(
+        id="callback-1",
+        from_user=User(id=1, is_bot=False, first_name="Admin"),
+        chat_instance="private-1",
+        message=message,
+        data=data,
+    ).as_(bot)
+
+
+def make_router(jobs, *, health=None):
+    health = health or SimpleNamespace(check=AsyncMock())
+    settings = SimpleNamespace(
+        auto_add_source_tags=True,
+        max_tags=20,
+        max_tag_length=64,
+        max_job_attempts=3,
+        default_channel_alias="artwork",
+    )
+    return build_router(
+        ingest=SimpleNamespace(),
+        jobs=jobs,
+        previews=SimpleNamespace(send=AsyncMock()),
+        translator=SimpleNamespace(),
+        health=health,
+        wakeup=SimpleNamespace(set=Mock()),
+        registry=SimpleNamespace(names=("pixiv", "deviantart", "direct")),
+        settings=settings,
+    )
+
+
+def handler(router, observer: str, name: str):
+    handlers = getattr(router, observer).handlers
+    return next(item.callback for item in handlers if item.callback.__name__ == name)
+
+
+def test_main_menu_has_requested_persistent_layout():
+    markup = main_menu_keyboard()
+
+    assert [[button.text for button in row] for row in markup.keyboard] == [
+        [QUEUE_BUTTON, PREVIEW_BUTTON],
+        [STATS_BUTTON, CHANNELS_BUTTON],
+        [HEALTH_BUTTON, HELP_BUTTON],
+    ]
+    assert markup.resize_keyboard is True
+    assert markup.is_persistent is True
+    assert markup.one_time_keyboard is False
+
+
+def test_queue_menu_lists_all_and_only_enabled_channel_buttons():
+    buttons = flatten(queue_menu_keyboard(make_channels()))
+
+    assert [button.text for button in buttons] == [
+        "🌐 Все каналы",
+        "📥 artwork — Artwork",
+        "⬅️ Назад",
+    ]
+    assert [button.callback_data for button in buttons] == [
+        "menu:queue:all",
+        "menu:queue:7",
+        BACK_CALLBACK,
+    ]
+
+
+def test_preview_menu_lists_nearest_and_only_enabled_channels():
+    buttons = flatten(preview_menu_keyboard(make_channels()))
+
+    assert [button.text for button in buttons] == [
+        "⏭ Ближайший пост",
+        "🖼 artwork — Artwork",
+        "⬅️ Назад",
+    ]
+    assert [button.callback_data for button in buttons] == [
+        "menu:preview:next",
+        "menu:preview:7",
+        BACK_CALLBACK,
+    ]
+
+
+def test_channels_menu_lists_enabled_and_disabled_registered_channels():
+    buttons = flatten(channels_menu_keyboard(make_channels()))
+
+    assert [button.text for button in buttons] == [
+        "🟢 artwork — Artwork",
+        "⚪ archive — Archive",
+        "⬅️ Назад",
+    ]
+    assert [button.callback_data for button in buttons] == [
+        "menu:channel:7",
+        "menu:channel:8",
+        BACK_CALLBACK,
+    ]
+
+
+def test_health_menu_has_refresh_full_and_back_actions():
+    buttons = flatten(health_menu_keyboard())
+
+    assert [button.text for button in buttons] == [
+        "🔄 Обновить",
+        "🔬 Полная проверка",
+        "⬅️ Назад",
+    ]
+    assert [button.callback_data for button in buttons] == [
+        "menu:health:refresh",
+        "menu:health:full",
+        BACK_CALLBACK,
+    ]
+
+
+def test_menu_callback_data_stays_within_telegram_limit():
+    markups = [
+        queue_menu_keyboard(make_channels()),
+        preview_menu_keyboard(make_channels()),
+        channels_menu_keyboard(make_channels()),
+        health_menu_keyboard(),
+    ]
+
+    assert all(
+        len(button.callback_data.encode("utf-8")) <= 64
+        for markup in markups
+        for button in flatten(markup)
+    )
+
+
+def test_help_catalog_exactly_covers_router_slash_commands():
+    router_path = Path(__file__).parents[1] / "app" / "bot" / "router.py"
+    tree = ast.parse(router_path.read_text(encoding="utf-8"))
+    routed_commands = {
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Command"
+        for argument in node.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    }
+
+    catalog_commands = {item.command for item in COMMAND_CATALOG}
+
+    assert catalog_commands == routed_commands
+
+
+def test_help_and_telegram_commands_use_the_same_catalog():
+    help_text = render_help()
+    commands = bot_commands()
+
+    assert len(help_text) <= 4096
+    assert [command.command for command in commands] == [
+        item.command for item in COMMAND_CATALOG
+    ]
+    assert all(1 <= len(command.description) <= 256 for command in commands)
+    assert all(f"<code>{escape(item.usage)}</code>" in help_text for item in COMMAND_CATALOG)
+
+
+async def test_configure_bot_ui_registers_commands_and_command_menu_button():
+    bot = SimpleNamespace(
+        set_my_commands=AsyncMock(),
+        set_chat_menu_button=AsyncMock(),
+    )
+
+    await configure_bot_ui(bot)
+
+    bot.set_my_commands.assert_awaited_once()
+    registered = bot.set_my_commands.await_args.args[0]
+    assert [command.command for command in registered] == [
+        item.command for item in COMMAND_CATALOG
+    ]
+    bot.set_chat_menu_button.assert_awaited_once()
+    assert isinstance(
+        bot.set_chat_menu_button.await_args.kwargs["menu_button"],
+        MenuButtonCommands,
+    )
+
+
+async def test_queue_callback_runs_alias_filtered_queue_and_keeps_menu():
+    jobs = SimpleNamespace(
+        channels=AsyncMock(return_value=make_channels()),
+        queue=AsyncMock(return_value=[]),
+    )
+    router = make_router(jobs)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "menu:queue:7")
+
+    await handler(router, "callback_query", "queue_menu_selection")(callback)
+
+    jobs.queue.assert_awaited_once_with("artwork", limit=None)
+    assert any(isinstance(request, AnswerCallbackQuery) for request in bot.requests)
+    edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
+    assert edit.text == "Очередь канала artwork пуста."
+    assert [button.callback_data for button in flatten(edit.reply_markup)] == [
+        "menu:queue:all",
+        "menu:queue:7",
+        BACK_CALLBACK,
+    ]
+
+
+async def test_preview_callback_starts_loading_only_after_channel_selection():
+    jobs = SimpleNamespace(
+        channels=AsyncMock(return_value=make_channels()),
+        queue=AsyncMock(return_value=[]),
+    )
+    router = make_router(jobs)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "menu:preview:7")
+
+    await handler(router, "callback_query", "preview_menu_selection")(callback)
+
+    jobs.queue.assert_awaited_once_with("artwork", limit=None)
+    edits = [request for request in bot.requests if isinstance(request, EditMessageText)]
+    answers = [request for request in bot.requests if isinstance(request, SendMessage)]
+    assert edits[0].text == "⏳ Ищу ближайший пост · канал artwork"
+    assert answers[-1].text == "В очереди канала artwork нет заданий для предпросмотра."
+
+
+async def test_health_full_callback_runs_full_check_and_restores_controls():
+    jobs = SimpleNamespace()
+    health = SimpleNamespace(check=AsyncMock(return_value=HealthReport(
+        healthy=True,
+        uptime_seconds=3600,
+        elapsed_ms=12,
+        lines=(),
+    )))
+    router = make_router(jobs, health=health)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "menu:health:full")
+
+    await handler(router, "callback_query", "health_menu_selection")(callback)
+
+    health.check.assert_awaited_once_with(full=True)
+    edits = [request for request in bot.requests if isinstance(request, EditMessageText)]
+    assert edits[0].text == "⏳ Выполняю полную проверку здоровья бота…"
+    assert "Bot healthy" in edits[-1].text
+    assert [button.callback_data for button in flatten(edits[-1].reply_markup)] == [
+        "menu:health:refresh",
+        "menu:health:full",
+        BACK_CALLBACK,
+    ]
+
+
+async def test_back_callback_reinstalls_persistent_main_keyboard():
+    router = make_router(SimpleNamespace())
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), BACK_CALLBACK)
+
+    await handler(router, "callback_query", "return_to_main_menu")(callback)
+
+    assert any(isinstance(request, DeleteMessage) for request in bot.requests)
+    answer = next(request for request in bot.requests if isinstance(request, SendMessage))
+    assert answer.text.startswith("🎛 Главное меню")
+    assert answer.reply_markup.is_persistent is True
+
+
+async def test_stats_button_runs_existing_stats_action():
+    jobs = SimpleNamespace(stats=AsyncMock(return_value={"queued": 3, "failed": 1}))
+    router = make_router(jobs)
+    bot = RecordingBot()
+    message = make_message(bot, STATS_BUTTON)
+
+    await handler(router, "message", "stats_button")(message)
+
+    jobs.stats.assert_awaited_once()
+    answer = next(request for request in bot.requests if isinstance(request, SendMessage))
+    assert answer.text == "failed: 1\nqueued: 3"

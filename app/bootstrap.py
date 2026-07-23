@@ -7,6 +7,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy import select
 
+from app.bot.menu import configure_bot_ui
 from app.bot.middleware import AdminOnlyMiddleware
 from app.bot.router import build_router
 from app.config import Settings
@@ -38,8 +39,9 @@ class Application:
     workers: WorkerPool
 
     async def run(self) -> None:
-        await self.workers.start()
         try:
+            await configure_bot_ui(self.bot)
+            await self.workers.start()
             await self.dispatcher.start_polling(self.bot, allowed_updates=self.dispatcher.resolve_used_update_types())
         finally:
             await self.workers.stop()

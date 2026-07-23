@@ -1,0 +1,168 @@
+from collections.abc import Sequence
+from dataclasses import dataclass
+from html import escape
+
+from aiogram import Bot
+from aiogram.types import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    MenuButtonCommands,
+    ReplyKeyboardMarkup,
+)
+
+from app.db.models import Channel
+
+
+QUEUE_BUTTON = "📋 Очередь"
+PREVIEW_BUTTON = "🖼 Следующий пост"
+STATS_BUTTON = "📊 Статистика"
+CHANNELS_BUTTON = "📡 Каналы"
+HEALTH_BUTTON = "🩺 Здоровье"
+HELP_BUTTON = "ℹ️ Помощь"
+
+BACK_CALLBACK = "menu:back"
+QUEUE_CALLBACK_PREFIX = "menu:queue:"
+PREVIEW_CALLBACK_PREFIX = "menu:preview:"
+CHANNEL_CALLBACK_PREFIX = "menu:channel:"
+HEALTH_CALLBACK_PREFIX = "menu:health:"
+
+MAIN_MENU_TEXT = (
+    "🎛 Главное меню\n\n"
+    "Выберите действие или отправьте ссылку на публикацию."
+)
+
+
+@dataclass(frozen=True)
+class CommandHelp:
+    command: str
+    usage: str
+    summary: str
+    details: str
+    section: str
+
+
+COMMAND_CATALOG = (
+    CommandHelp("start", "/start", "Открыть главное меню", "открывает главное меню и постоянную клавиатуру.", "Навигация"),
+    CommandHelp("menu", "/menu", "Открыть главное меню", "повторно показывает главное меню.", "Навигация"),
+    CommandHelp("help", "/help", "Показать памятку", "показывает актуальную памятку по всем командам.", "Навигация"),
+    CommandHelp("queue", "/queue [alias]", "Показать очередь", "без аргумента показывает общую очередь; с alias — очередь выбранного канала.", "Очередь и публикации"),
+    CommandHelp("preview", "/preview [job_id|alias]", "Предпросмотр следующего поста", "без аргумента показывает ближайший queued-пост; с ID — указанное задание; с alias — ближайший пост канала.", "Очередь и публикации"),
+    CommandHelp("publish", "/publish [job_id]", "Опубликовать без ожидания", "ставит ближайшее или указанное queued-задание на ручную публикацию.", "Очередь и публикации"),
+    CommandHelp("status", "/status <job_id>", "Показать состояние задания", "показывает текущий статус задания по его ID.", "Очередь и публикации"),
+    CommandHelp("cancel", "/cancel <job_id>", "Отменить задание", "отменяет задание, если его текущая стадия это допускает.", "Очередь и публикации"),
+    CommandHelp("retry", "/retry <job_id>", "Повторить задание", "повторно ставит доступное для повтора задание в очередь.", "Очередь и публикации"),
+    CommandHelp("recent", "/recent", "Показать последние задания", "показывает недавние задания и их статусы.", "Очередь и публикации"),
+    CommandHelp("channels", "/channels", "Показать каналы", "показывает зарегистрированные каналы и интервалы публикации.", "Каналы и источники"),
+    CommandHelp("channel_interval", "/channel_interval <alias> <30s|15m|2h|1d|0>", "Изменить интервал канала", "задаёт интервал автопубликации; 0 отключает ожидание между постами.", "Каналы и источники"),
+    CommandHelp("providers", "/providers", "Показать источники", "показывает поддерживаемые источники изображений.", "Каналы и источники"),
+    CommandHelp("stats", "/stats", "Показать статистику", "показывает текущую статистику заданий.", "Диагностика"),
+    CommandHelp("health", "/health [full]", "Проверить здоровье бота", "без аргумента выполняет быструю проверку; full добавляет каналы, storage, размер БД и внешние providers.", "Диагностика"),
+)
+
+
+def bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command=item.command, description=item.summary)
+        for item in COMMAND_CATALOG
+    ]
+
+
+async def configure_bot_ui(bot: Bot) -> None:
+    await bot.set_my_commands(bot_commands())
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
+def render_help() -> str:
+    lines = [
+        "📚 <b>Памятка по командам</b>",
+        "",
+        "<b>Добавление публикации</b>",
+        "<code>URL [теги] [--channel alias]</code>",
+        "Можно передать несколько ссылок; теги и выбранный канал применятся ко всем.",
+    ]
+    sections = dict.fromkeys(item.section for item in COMMAND_CATALOG)
+    for section in sections:
+        lines.extend(("", f"<b>{escape(section)}</b>"))
+        lines.extend(
+            f"<code>{escape(item.usage)}</code> — {escape(item.details)}"
+            for item in COMMAND_CATALOG
+            if item.section == section
+        )
+    lines.extend((
+        "",
+        "<i>[аргумент]</i> — необязательный, <i>&lt;аргумент&gt;</i> — обязательный.",
+    ))
+    return "\n".join(lines)
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=QUEUE_BUTTON), KeyboardButton(text=PREVIEW_BUTTON)],
+            [KeyboardButton(text=STATS_BUTTON), KeyboardButton(text=CHANNELS_BUTTON)],
+            [KeyboardButton(text=HEALTH_BUTTON), KeyboardButton(text=HELP_BUTTON)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Отправьте ссылку или выберите действие",
+    )
+
+
+def queue_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="🌐 Все каналы", callback_data=f"{QUEUE_CALLBACK_PREFIX}all")]]
+    rows.extend([
+        InlineKeyboardButton(
+            text=_channel_button_text(channel, "📥"),
+            callback_data=f"{QUEUE_CALLBACK_PREFIX}{channel.id}",
+        )
+    ] for channel in channels if channel.is_enabled)
+    rows.append(_back_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def preview_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="⏭ Ближайший пост", callback_data=f"{PREVIEW_CALLBACK_PREFIX}next")]]
+    rows.extend([
+        InlineKeyboardButton(
+            text=_channel_button_text(channel, "🖼"),
+            callback_data=f"{PREVIEW_CALLBACK_PREFIX}{channel.id}",
+        )
+    ] for channel in channels if channel.is_enabled)
+    rows.append(_back_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def channels_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(
+            text=_channel_button_text(channel, "🟢" if channel.is_enabled else "⚪"),
+            callback_data=f"{CHANNEL_CALLBACK_PREFIX}{channel.id}",
+        )
+    ] for channel in channels]
+    rows.append(_back_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def health_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"{HEALTH_CALLBACK_PREFIX}refresh"),
+            InlineKeyboardButton(text="🔬 Полная проверка", callback_data=f"{HEALTH_CALLBACK_PREFIX}full"),
+        ],
+        _back_row(),
+    ])
+
+
+def back_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[_back_row()])
+
+
+def _back_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="⬅️ Назад", callback_data=BACK_CALLBACK)]
+
+
+def _channel_button_text(channel: Channel, icon: str) -> str:
+    return f"{icon} {channel.alias} — {channel.title}"[:64]

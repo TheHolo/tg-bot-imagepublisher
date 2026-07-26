@@ -5,7 +5,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageText, SendMessage
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    DeleteMessage,
+    EditMessageReplyMarkup,
+    EditMessageText,
+    SendMessage,
+)
 from aiogram.types import CallbackQuery, Chat, MenuButtonCommands, Message, User
 
 from app.bot.menu import (
@@ -28,6 +34,7 @@ from app.bot.menu import (
 )
 from app.bot.router import build_router
 from app.db.models import Channel
+from app.domain.enums import JobStatus
 from app.services.health_service import HealthReport
 
 
@@ -41,6 +48,19 @@ def make_channels() -> list[Channel]:
             id=8, alias="archive", telegram_chat_id="-1002",
             title="Archive", is_enabled=False,
         ),
+    ]
+
+
+def make_many_channels(count: int) -> list[Channel]:
+    return [
+        Channel(
+            id=index,
+            alias=f"channel-{index:02d}",
+            telegram_chat_id=f"-{1000 + index}",
+            title=f"Channel {index:02d}",
+            is_enabled=True,
+        )
+        for index in range(1, count + 1)
     ]
 
 
@@ -125,8 +145,8 @@ def test_queue_menu_lists_all_and_only_enabled_channel_buttons():
         "⬅️ Назад",
     ]
     assert [button.callback_data for button in buttons] == [
-        "menu:queue:all",
-        "menu:queue:7",
+        "menu:queue:0:all",
+        "menu:queue:0:7",
         BACK_CALLBACK,
     ]
 
@@ -140,8 +160,8 @@ def test_preview_menu_lists_nearest_and_only_enabled_channels():
         "⬅️ Назад",
     ]
     assert [button.callback_data for button in buttons] == [
-        "menu:preview:next",
-        "menu:preview:7",
+        "menu:preview:0:next",
+        "menu:preview:0:7",
         BACK_CALLBACK,
     ]
 
@@ -155,10 +175,61 @@ def test_channels_menu_lists_enabled_and_disabled_registered_channels():
         "⬅️ Назад",
     ]
     assert [button.callback_data for button in buttons] == [
-        "menu:channel:7",
-        "menu:channel:8",
+        "menu:channel:0:7",
+        "menu:channel:0:8",
         BACK_CALLBACK,
     ]
+
+
+def test_queue_channel_list_is_paginated_by_ten():
+    channels = make_many_channels(23)
+
+    first = flatten(queue_menu_keyboard(channels, page=0))
+    middle = flatten(queue_menu_keyboard(channels, page=1))
+    last = flatten(queue_menu_keyboard(channels, page=2))
+
+    assert sum(
+        button.callback_data.startswith("menu:queue:")
+        and button.callback_data.rsplit(":", 1)[-1].isdigit()
+        for button in first
+    ) == 10
+    assert "menu:queue_page:1" in [button.callback_data for button in first]
+    assert "menu:queue_page:0" in [button.callback_data for button in middle]
+    assert "menu:queue_page:2" in [button.callback_data for button in middle]
+    assert [
+        button.callback_data for button in last
+        if button.callback_data.startswith("menu:queue:2:")
+        and button.callback_data.rsplit(":", 1)[-1].isdigit()
+    ] == ["menu:queue:2:21", "menu:queue:2:22", "menu:queue:2:23"]
+    assert "menu:queue_page:1" in [button.callback_data for button in last]
+    assert "menu:queue_page:3" not in [button.callback_data for button in last]
+
+
+def test_preview_and_registered_channel_lists_use_the_requested_page():
+    channels = make_many_channels(12)
+    channels[10].is_enabled = False
+
+    preview_buttons = flatten(preview_menu_keyboard(channels, page=1))
+    channel_buttons = flatten(channels_menu_keyboard(channels, page=1))
+
+    assert [
+        button.callback_data for button in preview_buttons
+        if button.callback_data.startswith("menu:preview:1:")
+    ] == ["menu:preview:1:next", "menu:preview:1:12"]
+    assert [
+        button.callback_data for button in channel_buttons
+        if button.callback_data.startswith("menu:channel:1:")
+    ] == ["menu:channel:1:11", "menu:channel:1:12"]
+    assert channel_buttons[0].text.startswith("⚪ channel-11")
+
+
+def test_exactly_ten_channels_do_not_add_page_navigation():
+    callbacks = [
+        button.callback_data
+        for button in flatten(queue_menu_keyboard(make_many_channels(10)))
+    ]
+
+    assert not any(callback.startswith("menu:queue_page:") for callback in callbacks)
 
 
 def test_health_menu_has_refresh_full_and_back_actions():
@@ -243,22 +314,45 @@ async def test_configure_bot_ui_registers_commands_and_command_menu_button():
 
 async def test_queue_callback_runs_alias_filtered_queue_and_keeps_menu():
     jobs = SimpleNamespace(
-        channels=AsyncMock(return_value=make_channels()),
+        channels=AsyncMock(return_value=make_many_channels(12)),
         queue=AsyncMock(return_value=[]),
     )
     router = make_router(jobs)
     bot = RecordingBot()
-    callback = make_callback(bot, make_message(bot), "menu:queue:7")
+    callback = make_callback(bot, make_message(bot), "menu:queue:1:12")
 
     await handler(router, "callback_query", "queue_menu_selection")(callback)
 
-    jobs.queue.assert_awaited_once_with("artwork", limit=None)
+    jobs.queue.assert_awaited_once_with("channel-12", limit=None)
     assert any(isinstance(request, AnswerCallbackQuery) for request in bot.requests)
     edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
-    assert edit.text == "Очередь канала artwork пуста."
+    assert edit.text == "Очередь канала channel-12 пуста."
     assert [button.callback_data for button in flatten(edit.reply_markup)] == [
-        "menu:queue:all",
-        "menu:queue:7",
+        "menu:queue:1:all",
+        "menu:queue:1:11",
+        "menu:queue:1:12",
+        "menu:queue_page:0",
+        BACK_CALLBACK,
+    ]
+
+
+async def test_queue_page_callback_replaces_markup_with_requested_page():
+    jobs = SimpleNamespace(channels=AsyncMock(return_value=make_many_channels(12)))
+    router = make_router(jobs)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "menu:queue_page:1")
+
+    await handler(router, "callback_query", "queue_menu_page")(callback)
+
+    edit = next(
+        request for request in bot.requests
+        if isinstance(request, EditMessageReplyMarkup)
+    )
+    assert [button.callback_data for button in flatten(edit.reply_markup)] == [
+        "menu:queue:1:all",
+        "menu:queue:1:11",
+        "menu:queue:1:12",
+        "menu:queue_page:0",
         BACK_CALLBACK,
     ]
 
@@ -270,7 +364,7 @@ async def test_preview_callback_starts_loading_only_after_channel_selection():
     )
     router = make_router(jobs)
     bot = RecordingBot()
-    callback = make_callback(bot, make_message(bot), "menu:preview:7")
+    callback = make_callback(bot, make_message(bot), "menu:preview:0:7")
 
     await handler(router, "callback_query", "preview_menu_selection")(callback)
 
@@ -279,6 +373,31 @@ async def test_preview_callback_starts_loading_only_after_channel_selection():
     answers = [request for request in bot.requests if isinstance(request, SendMessage)]
     assert edits[0].text == "⏳ Ищу ближайший пост · канал artwork"
     assert answers[-1].text == "В очереди канала artwork нет заданий для предпросмотра."
+
+
+async def test_change_channel_page_callback_uses_second_batch_of_ten():
+    jobs = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(
+            id=42,
+            status=JobStatus.WAITING_CONFIRMATION,
+            target_channel_id=15,
+        )),
+        channels=AsyncMock(return_value=make_many_channels(23)),
+    )
+    router = make_router(jobs)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "channel_select_page:42:1")
+
+    await handler(router, "callback_query", "channel_selection_page")(callback)
+
+    edit = next(
+        request for request in bot.requests
+        if isinstance(request, EditMessageReplyMarkup)
+    )
+    assert [
+        button.callback_data for button in flatten(edit.reply_markup)
+        if button.callback_data.startswith("channel_select:42:")
+    ] == [f"channel_select:42:{index}" for index in range(11, 21)]
 
 
 async def test_health_full_callback_runs_full_check_and_restores_controls():

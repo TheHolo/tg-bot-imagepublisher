@@ -11,20 +11,26 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.bot.menu import (
     BACK_CALLBACK,
     CHANNEL_CALLBACK_PREFIX,
+    CHANNEL_PAGE_CALLBACK_PREFIX,
     CHANNELS_BUTTON,
+    CHANNELS_PER_PAGE,
     HEALTH_BUTTON,
     HEALTH_CALLBACK_PREFIX,
     HELP_BUTTON,
     MAIN_MENU_TEXT,
     PREVIEW_BUTTON,
     PREVIEW_CALLBACK_PREFIX,
+    PREVIEW_PAGE_CALLBACK_PREFIX,
     QUEUE_BUTTON,
     QUEUE_CALLBACK_PREFIX,
+    QUEUE_PAGE_CALLBACK_PREFIX,
     STATS_BUTTON,
     back_menu_keyboard,
     channels_menu_keyboard,
     health_menu_keyboard,
     main_menu_keyboard,
+    paginate_channels,
+    pagination_row,
     preview_menu_keyboard,
     queue_menu_keyboard,
     render_help,
@@ -76,14 +82,20 @@ def cancel_tag_input_keyboard(job_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def channel_selection_keyboard(job_id: int, channels, current_channel_id: int) -> InlineKeyboardMarkup:
+def channel_selection_keyboard(
+    job_id: int, channels, current_channel_id: int, page: int = 0,
+) -> InlineKeyboardMarkup:
+    visible, page, page_count = paginate_channels(channels, page)
     rows = [
         [InlineKeyboardButton(
             text=f"{'✓ ' if channel.id == current_channel_id else ''}{channel.alias} — {channel.title}"[:64],
             callback_data=f"channel_select:{job_id}:{channel.id}",
         )]
-        for channel in channels
+        for channel in visible
     ]
+    navigation = pagination_row(page, page_count, f"channel_select_page:{job_id}:")
+    if navigation:
+        rows.append(navigation)
     rows.append([InlineKeyboardButton(text="Отмена", callback_data=f"channel_select_cancel:{job_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -113,6 +125,25 @@ def build_router(
             return callback.message
         await callback.answer("Сообщение меню больше недоступно.", show_alert=True)
         return None
+
+    def parse_page(data: str, prefix: str) -> int | None:
+        value = data.removeprefix(prefix)
+        return int(value) if value.isdigit() else None
+
+    def parse_paginated_selection(data: str, prefix: str) -> tuple[int, str] | None:
+        parts = data.removeprefix(prefix).split(":", 1)
+        if len(parts) == 1:
+            return 0, parts[0]  # Compatibility with buttons sent before pagination was added.
+        if not parts[0].isdigit():
+            return None
+        return int(parts[0]), parts[1]
+
+    async def edit_menu_markup(message: Message, markup: InlineKeyboardMarkup) -> None:
+        try:
+            await message.edit_reply_markup(reply_markup=markup)
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
 
     @router.message(Command("start", "menu"))
     async def main_menu(message: Message) -> None:
@@ -167,6 +198,19 @@ def build_router(
     @router.callback_query(F.data.startswith(CHANNEL_CALLBACK_PREFIX))
     async def registered_channel_noop(callback: CallbackQuery) -> None:
         await callback.answer()
+
+    @router.callback_query(F.data.startswith(CHANNEL_PAGE_CALLBACK_PREFIX))
+    async def channels_menu_page(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = parse_page(callback.data, CHANNEL_PAGE_CALLBACK_PREFIX)
+        if page is None:
+            await callback.answer("Некорректная страница.", show_alert=True)
+            return
+        channels = await jobs.channels()
+        await callback.answer()
+        await edit_menu_markup(message, channels_menu_keyboard(channels, page))
 
     @router.message(Command("channel_interval"))
     async def channel_interval(message: Message, command: CommandObject) -> None:
@@ -237,12 +281,29 @@ def build_router(
             reply_markup=queue_menu_keyboard(channels),
         )
 
+    @router.callback_query(F.data.startswith(QUEUE_PAGE_CALLBACK_PREFIX))
+    async def queue_menu_page(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = parse_page(callback.data, QUEUE_PAGE_CALLBACK_PREFIX)
+        if page is None:
+            await callback.answer("Некорректная страница.", show_alert=True)
+            return
+        channels = await jobs.channels()
+        await callback.answer()
+        await edit_menu_markup(message, queue_menu_keyboard(channels, page))
+
     @router.callback_query(F.data.startswith(QUEUE_CALLBACK_PREFIX))
     async def queue_menu_selection(callback: CallbackQuery) -> None:
         message = await menu_callback_message(callback)
         if message is None or callback.data is None:
             return
-        selection = callback.data.removeprefix(QUEUE_CALLBACK_PREFIX)
+        parsed = parse_paginated_selection(callback.data, QUEUE_CALLBACK_PREFIX)
+        if parsed is None:
+            await callback.answer("Некорректный пункт меню.", show_alert=True)
+            return
+        page, selection = parsed
         channels = await jobs.channels()
         alias = None
         if selection != "all":
@@ -260,7 +321,7 @@ def build_router(
         await callback.answer()
         text = await queue_text(alias)
         try:
-            await message.edit_text(text, reply_markup=queue_menu_keyboard(channels))
+            await message.edit_text(text, reply_markup=queue_menu_keyboard(channels, page))
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
                 raise
@@ -340,12 +401,29 @@ def build_router(
             reply_markup=preview_menu_keyboard(channels),
         )
 
+    @router.callback_query(F.data.startswith(PREVIEW_PAGE_CALLBACK_PREFIX))
+    async def preview_menu_page(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = parse_page(callback.data, PREVIEW_PAGE_CALLBACK_PREFIX)
+        if page is None:
+            await callback.answer("Некорректная страница.", show_alert=True)
+            return
+        channels = await jobs.channels()
+        await callback.answer()
+        await edit_menu_markup(message, preview_menu_keyboard(channels, page))
+
     @router.callback_query(F.data.startswith(PREVIEW_CALLBACK_PREFIX))
     async def preview_menu_selection(callback: CallbackQuery) -> None:
         message = await menu_callback_message(callback)
         if message is None or callback.data is None:
             return
-        selection = callback.data.removeprefix(PREVIEW_CALLBACK_PREFIX)
+        parsed = parse_paginated_selection(callback.data, PREVIEW_CALLBACK_PREFIX)
+        if parsed is None:
+            await callback.answer("Некорректный пункт меню.", show_alert=True)
+            return
+        _, selection = parsed
         argument = ""
         if selection != "next":
             if not selection.isdigit():
@@ -551,10 +629,44 @@ def build_router(
             await callback.answer("Нет доступных каналов.", show_alert=True)
             return
         await state.clear()
+        current_page = next(
+            (
+                index // CHANNELS_PER_PAGE
+                for index, channel in enumerate(channels)
+                if channel.id == job.target_channel_id
+            ),
+            0,
+        )
         await callback.message.edit_reply_markup(
-            reply_markup=channel_selection_keyboard(job_id, channels, job.target_channel_id)
+            reply_markup=channel_selection_keyboard(
+                job_id, channels, job.target_channel_id, current_page,
+            )
         )
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("channel_select_page:"))
+    async def channel_selection_page(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            await callback.answer("Некорректная страница.", show_alert=True)
+            return
+        job_id, page = int(parts[1]), int(parts[2])
+        job = await jobs.get(job_id)
+        if not job or job.status != JobStatus.WAITING_CONFIRMATION:
+            await callback.answer("Предпросмотр уже недоступен.", show_alert=True)
+            return
+        channels = [channel for channel in await jobs.channels() if channel.is_enabled]
+        if not channels:
+            await callback.answer("Нет доступных каналов.", show_alert=True)
+            return
+        await callback.answer()
+        await edit_menu_markup(
+            message,
+            channel_selection_keyboard(job_id, channels, job.target_channel_id, page),
+        )
 
     @router.callback_query(F.data.startswith("channel_select:"))
     async def select_channel(callback: CallbackQuery) -> None:

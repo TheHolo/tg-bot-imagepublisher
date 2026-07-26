@@ -54,6 +54,46 @@ def test_channel_selection_keyboard_lists_channels_and_marks_current():
     ]
 
 
+def test_channel_selection_keyboard_is_paginated_by_ten():
+    channels = [
+        Channel(
+            id=index,
+            alias=f"channel-{index:02d}",
+            telegram_chat_id=f"-{1000 + index}",
+            title=f"Channel {index:02d}",
+        )
+        for index in range(1, 24)
+    ]
+
+    first = channel_selection_keyboard(42, channels, current_channel_id=15, page=0)
+    middle = channel_selection_keyboard(42, channels, current_channel_id=15, page=1)
+    last = channel_selection_keyboard(42, channels, current_channel_id=15, page=2)
+
+    first_buttons = [button for row in first.inline_keyboard for button in row]
+    middle_buttons = [button for row in middle.inline_keyboard for button in row]
+    last_buttons = [button for row in last.inline_keyboard for button in row]
+    assert [
+        button.callback_data for button in first_buttons
+        if button.callback_data.startswith("channel_select:42:")
+    ] == [f"channel_select:42:{index}" for index in range(1, 11)]
+    assert [
+        button.callback_data for button in middle_buttons
+        if button.callback_data.startswith("channel_select:42:")
+    ] == [f"channel_select:42:{index}" for index in range(11, 21)]
+    assert next(
+        button.text for button in middle_buttons
+        if button.callback_data == "channel_select:42:15"
+    ).startswith("✓ ")
+    assert "channel_select_page:42:0" in [button.callback_data for button in middle_buttons]
+    assert "channel_select_page:42:2" in [button.callback_data for button in middle_buttons]
+    assert [
+        button.callback_data for button in last_buttons
+        if button.callback_data.startswith("channel_select:42:")
+    ] == ["channel_select:42:21", "channel_select:42:22", "channel_select:42:23"]
+    assert "channel_select_page:42:1" in [button.callback_data for button in last_buttons]
+    assert "channel_select_page:42:3" not in [button.callback_data for button in last_buttons]
+
+
 def test_replace_channel_line_keeps_the_rest_of_preview():
     text = "Источник: Pixiv\nКанал: artwork\n\nТеги: #art"
 

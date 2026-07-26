@@ -22,10 +22,14 @@ CHANNELS_BUTTON = "📡 Каналы"
 HEALTH_BUTTON = "🩺 Здоровье"
 HELP_BUTTON = "ℹ️ Помощь"
 
+CHANNELS_PER_PAGE = 10
 BACK_CALLBACK = "menu:back"
 QUEUE_CALLBACK_PREFIX = "menu:queue:"
+QUEUE_PAGE_CALLBACK_PREFIX = "menu:queue_page:"
 PREVIEW_CALLBACK_PREFIX = "menu:preview:"
+PREVIEW_PAGE_CALLBACK_PREFIX = "menu:preview_page:"
 CHANNEL_CALLBACK_PREFIX = "menu:channel:"
+CHANNEL_PAGE_CALLBACK_PREFIX = "menu:channel_page:"
 HEALTH_CALLBACK_PREFIX = "menu:health:"
 
 MAIN_MENU_TEXT = (
@@ -111,37 +115,57 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def queue_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="🌐 Все каналы", callback_data=f"{QUEUE_CALLBACK_PREFIX}all")]]
+def queue_menu_keyboard(channels: Sequence[Channel], page: int = 0) -> InlineKeyboardMarkup:
+    visible, page, page_count = paginate_channels(
+        [channel for channel in channels if channel.is_enabled], page,
+    )
+    rows = [[InlineKeyboardButton(
+        text="🌐 Все каналы", callback_data=f"{QUEUE_CALLBACK_PREFIX}{page}:all",
+    )]]
     rows.extend([
         InlineKeyboardButton(
             text=_channel_button_text(channel, "📥"),
-            callback_data=f"{QUEUE_CALLBACK_PREFIX}{channel.id}",
+            callback_data=f"{QUEUE_CALLBACK_PREFIX}{page}:{channel.id}",
         )
-    ] for channel in channels if channel.is_enabled)
+    ] for channel in visible)
+    navigation = pagination_row(page, page_count, QUEUE_PAGE_CALLBACK_PREFIX)
+    if navigation:
+        rows.append(navigation)
     rows.append(_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def preview_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="⏭ Ближайший пост", callback_data=f"{PREVIEW_CALLBACK_PREFIX}next")]]
+def preview_menu_keyboard(channels: Sequence[Channel], page: int = 0) -> InlineKeyboardMarkup:
+    visible, page, page_count = paginate_channels(
+        [channel for channel in channels if channel.is_enabled], page,
+    )
+    rows = [[InlineKeyboardButton(
+        text="⏭ Ближайший пост", callback_data=f"{PREVIEW_CALLBACK_PREFIX}{page}:next",
+    )]]
     rows.extend([
         InlineKeyboardButton(
             text=_channel_button_text(channel, "🖼"),
-            callback_data=f"{PREVIEW_CALLBACK_PREFIX}{channel.id}",
+            callback_data=f"{PREVIEW_CALLBACK_PREFIX}{page}:{channel.id}",
         )
-    ] for channel in channels if channel.is_enabled)
+    ] for channel in visible)
+    navigation = pagination_row(page, page_count, PREVIEW_PAGE_CALLBACK_PREFIX)
+    if navigation:
+        rows.append(navigation)
     rows.append(_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def channels_menu_keyboard(channels: Sequence[Channel]) -> InlineKeyboardMarkup:
+def channels_menu_keyboard(channels: Sequence[Channel], page: int = 0) -> InlineKeyboardMarkup:
+    visible, page, page_count = paginate_channels(channels, page)
     rows = [[
         InlineKeyboardButton(
             text=_channel_button_text(channel, "🟢" if channel.is_enabled else "⚪"),
-            callback_data=f"{CHANNEL_CALLBACK_PREFIX}{channel.id}",
+            callback_data=f"{CHANNEL_CALLBACK_PREFIX}{page}:{channel.id}",
         )
-    ] for channel in channels]
+    ] for channel in visible]
+    navigation = pagination_row(page, page_count, CHANNEL_PAGE_CALLBACK_PREFIX)
+    if navigation:
+        rows.append(navigation)
     rows.append(_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -158,6 +182,32 @@ def health_menu_keyboard() -> InlineKeyboardMarkup:
 
 def back_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[_back_row()])
+
+
+def paginate_channels(
+    channels: Sequence[Channel], page: int,
+) -> tuple[list[Channel], int, int]:
+    page_count = max(1, (len(channels) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE)
+    page = min(max(page, 0), page_count - 1)
+    start = page * CHANNELS_PER_PAGE
+    return list(channels[start:start + CHANNELS_PER_PAGE]), page, page_count
+
+
+def pagination_row(
+    page: int, page_count: int, callback_prefix: str,
+) -> list[InlineKeyboardButton]:
+    buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(
+            text="⬅️ Предыдущая страница",
+            callback_data=f"{callback_prefix}{page - 1}",
+        ))
+    if page + 1 < page_count:
+        buttons.append(InlineKeyboardButton(
+            text="Следующая страница ➡️",
+            callback_data=f"{callback_prefix}{page + 1}",
+        ))
+    return buttons
 
 
 def _back_row() -> list[InlineKeyboardButton]:

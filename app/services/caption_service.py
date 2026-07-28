@@ -5,7 +5,6 @@ from app.domain.models import SourcePost
 from app.utils.tags import hashtags
 from app.utils.text import provider_label, shorten
 
-
 DEFAULT_TEMPLATE = (
     '🖼 <b>{title}</b>\n\n{description_block}'
     '🎨 <a href="{author_url}">{author_name}</a>\n'
@@ -61,3 +60,13 @@ class CaptionService:
         if len(caption) > self.limit:
             raise MediaValidationError("Обязательные поля подписи превышают лимит Telegram")
         return caption
+
+    def build_custom(self, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise MediaValidationError("Подпись не может быть пустой")
+        if len(value) > self.limit:
+            raise MediaValidationError(
+                f"Подпись превышает лимит Telegram: {len(value)} из {self.limit} символов"
+            )
+        return escape(value)

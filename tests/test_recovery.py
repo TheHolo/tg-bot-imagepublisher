@@ -6,22 +6,29 @@ from app.domain.enums import JobStatus
 from app.services.job_service import JobService
 
 
-async def test_existing_database_gets_channel_lease_column(tmp_path):
+async def test_existing_database_gets_additive_columns(tmp_path):
     engine, _ = create_database(f"sqlite+aiosqlite:///{tmp_path / 'migration.db'}")
     await create_schema(engine)
     async with engine.begin() as connection:
         await connection.execute(text("DROP INDEX ix_channels_active_job_id"))
         await connection.execute(text("ALTER TABLE channels DROP COLUMN active_job_id"))
+        await connection.execute(text("ALTER TABLE jobs DROP COLUMN caption_override"))
 
     await create_schema(engine)
 
     async with engine.begin() as connection:
-        columns = await connection.run_sync(
+        channel_columns = await connection.run_sync(
             lambda sync_connection: {
                 column["name"] for column in inspect(sync_connection).get_columns("channels")
             }
         )
-    assert "active_job_id" in columns
+        job_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"] for column in inspect(sync_connection).get_columns("jobs")
+            }
+        )
+    assert "active_job_id" in channel_columns
+    assert "caption_override" in job_columns
     await engine.dispose()
 
 

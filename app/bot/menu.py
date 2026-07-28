@@ -14,7 +14,7 @@ from aiogram.types import (
 
 from app.db.models import Channel
 
-
+ADD_BUTTON = "➕ Добавить публикацию"
 QUEUE_BUTTON = "📋 Очередь"
 PREVIEW_BUTTON = "🖼 Следующий пост"
 STATS_BUTTON = "📊 Статистика"
@@ -51,6 +51,7 @@ COMMAND_CATALOG = (
     CommandHelp("start", "/start", "Открыть главное меню", "открывает главное меню и постоянную клавиатуру.", "Навигация"),
     CommandHelp("menu", "/menu", "Открыть главное меню", "повторно показывает главное меню.", "Навигация"),
     CommandHelp("help", "/help", "Показать памятку", "показывает актуальную памятку по всем командам.", "Навигация"),
+    CommandHelp("new", "/new", "Добавить публикацию", "запускает пошаговый мастер: ссылки, канал, подпись и подтверждение.", "Навигация"),
     CommandHelp("queue", "/queue [alias]", "Показать очередь", "без аргумента показывает общую очередь; с alias — очередь выбранного канала.", "Очередь и публикации"),
     CommandHelp("preview", "/preview [job_id|alias]", "Предпросмотр следующего поста", "без аргумента показывает ближайший queued-пост; с ID — указанное задание; с alias — ближайший пост канала.", "Очередь и публикации"),
     CommandHelp("publish", "/publish [job_id]", "Опубликовать без ожидания", "ставит ближайшее или указанное queued-задание на ручную публикацию.", "Очередь и публикации"),
@@ -83,8 +84,11 @@ def render_help() -> str:
         "📚 <b>Памятка по командам</b>",
         "",
         "<b>Добавление публикации</b>",
+        "Отправьте ссылку без дополнительных параметров или используйте <code>/new</code> — бот предложит выбрать канал кнопкой.",
+        "",
+        "<b>Быстрый режим</b>",
         "<code>URL [теги] [--channel alias]</code>",
-        "Можно передать несколько ссылок; теги и выбранный канал применятся ко всем.",
+        "Можно передать несколько ссылок; теги и выбранный канал применятся ко всем без запуска мастера.",
     ]
     sections = dict.fromkeys(item.section for item in COMMAND_CATALOG)
     for section in sections:
@@ -104,6 +108,7 @@ def render_help() -> str:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text=ADD_BUTTON)],
             [KeyboardButton(text=QUEUE_BUTTON), KeyboardButton(text=PREVIEW_BUTTON)],
             [KeyboardButton(text=STATS_BUTTON), KeyboardButton(text=CHANNELS_BUTTON)],
             [KeyboardButton(text=HEALTH_BUTTON), KeyboardButton(text=HELP_BUTTON)],

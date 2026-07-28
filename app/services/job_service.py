@@ -104,7 +104,8 @@ class JobService:
             return channel
 
     async def create_preview(
-        self, user_id: int, post: SourcePost, channel_id: int, tags: list[str], max_attempts: int
+        self, user_id: int, post: SourcePost, channel_id: int, tags: list[str], max_attempts: int,
+        caption_override: str | None = None,
     ) -> Job:
         async with self.sessions() as session, session.begin():
             job = Job(
@@ -118,6 +119,7 @@ class JobService:
                 user_tags=tags,
                 source_tags=post.source_tags,
                 post_data=serialize_post(post),
+                caption_override=caption_override,
                 max_attempts=max_attempts,
             )
             session.add(job)
@@ -125,6 +127,14 @@ class JobService:
             if user:
                 user.last_selected_channel_id = channel_id
             await session.flush()
+            return job
+
+    async def set_caption_override(self, job_id: int, caption: str | None) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not job or job.status not in {JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED}:
+                return None
+            job.caption_override = caption
             return job
 
     async def get(self, job_id: int) -> Job | None:

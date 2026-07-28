@@ -16,8 +16,8 @@ from app.services.caption_service import CaptionService
 from app.services.download_service import DownloadService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
-from app.services.publisher_service import TelegramPublisher
 from app.services.preview_service import deserialize_post
+from app.services.publisher_service import TelegramPublisher
 from app.services.translation_service import TranslationService
 from app.utils.tags import merge_tags
 
@@ -137,10 +137,16 @@ class WorkerPool:
         if await self.jobs.is_cancelled(job.id):
             await self.jobs.transition(job.id, JobStatus.CANCELLED)
             return
-        caption_tags = job.user_tags
-        if self.auto_add_source_tags:
-            caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
-        caption = self.captions.build(post, caption_tags, job.channel.caption_template or self.captions_template)
+        caption_override = getattr(job, "caption_override", None)
+        if caption_override is not None:
+            caption = self.captions.build_custom(caption_override)
+        else:
+            caption_tags = job.user_tags
+            if self.auto_add_source_tags:
+                caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
+            caption = self.captions.build(
+                post, caption_tags, job.channel.caption_template or self.captions_template,
+            )
         await self.jobs.transition(job.id, JobStatus.PUBLISHING)
         self._set_job_stage(job.id, JobStatus.PUBLISHING)
         result = await self.publisher.publish(job, post, prepared, job.channel, caption)

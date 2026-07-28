@@ -1,13 +1,22 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.domain.enums import JobStatus
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -57,6 +66,7 @@ class Job(Base):
     user_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     source_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     post_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    caption_override: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     error_code: Mapped[str | None] = mapped_column(String(64))

@@ -1,7 +1,12 @@
 from pathlib import Path
 
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.db.models import Base
 
@@ -37,3 +42,5 @@ def _upgrade_schema(connection) -> None:
     job_columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
     if "force_publish" not in job_columns:
         connection.execute(text("ALTER TABLE jobs ADD COLUMN force_publish BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "caption_override" not in job_columns:
+        connection.execute(text("ALTER TABLE jobs ADD COLUMN caption_override TEXT NULL"))

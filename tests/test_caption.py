@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -24,7 +24,7 @@ def test_caption_includes_clean_description_and_source_date():
         provider="pixiv", source_id="1", source_url="https://x", normalized_url="https://x",
         title="Title", description="<p>Short &amp; <b>useful</b><br>description.</p>",
         author_name="Artist", author_url="https://x/artist", media_items=[],
-        published_at=datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc),
+        published_at=datetime(2026, 7, 21, 10, 0, tzinfo=UTC),
     )
     caption = CaptionService().build(post, ["art"])
     assert "Short &amp; useful description." in caption
@@ -86,3 +86,18 @@ def test_caption_with_oversized_required_fields_fails_instead_of_looping():
 
     with pytest.raises(MediaValidationError, match="Обязательные поля"):
         CaptionService(limit=128).build(post, [])
+
+
+def test_custom_caption_is_plain_text_escaped_for_telegram_html():
+    caption = CaptionService().build_custom("  <b>My & caption</b>  ")
+
+    assert caption == "&lt;b&gt;My &amp; caption&lt;/b&gt;"
+
+
+def test_custom_caption_rejects_empty_and_oversized_values():
+    service = CaptionService(limit=10)
+
+    with pytest.raises(MediaValidationError, match="не может быть пустой"):
+        service.build_custom("   ")
+    with pytest.raises(MediaValidationError, match="превышает лимит"):
+        service.build_custom("x" * 11)

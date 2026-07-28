@@ -1,10 +1,13 @@
 import ast
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import (
     AnswerCallbackQuery,
     DeleteMessage,
@@ -15,6 +18,7 @@ from aiogram.methods import (
 from aiogram.types import CallbackQuery, Chat, MenuButtonCommands, Message, User
 
 from app.bot.menu import (
+    ADD_BUTTON,
     BACK_CALLBACK,
     CHANNELS_BUTTON,
     COMMAND_CATALOG,
@@ -33,9 +37,12 @@ from app.bot.menu import (
     render_help,
 )
 from app.bot.router import build_router
+from app.bot.states import CreatePublication, EditPreview
 from app.db.models import Channel
 from app.domain.enums import JobStatus
+from app.domain.models import MediaItem, SourcePost
 from app.services.health_service import HealthReport
+from app.services.job_service import serialize_post
 
 
 def make_channels() -> list[Channel]:
@@ -80,7 +87,7 @@ class RecordingBot:
 def make_message(bot: RecordingBot, text: str = "menu") -> Message:
     return Message(
         message_id=10,
-        date=datetime.now(timezone.utc),
+        date=datetime.now(UTC),
         chat=Chat(id=1, type="private"),
         from_user=User(id=1, is_bot=False, first_name="Admin"),
         text=text,
@@ -97,7 +104,7 @@ def make_callback(bot: RecordingBot, message: Message, data: str) -> CallbackQue
     ).as_(bot)
 
 
-def make_router(jobs, *, health=None):
+def make_router(jobs, *, health=None, ingest=None, previews=None, translator=None):
     health = health or SimpleNamespace(check=AsyncMock())
     settings = SimpleNamespace(
         auto_add_source_tags=True,
@@ -107,14 +114,36 @@ def make_router(jobs, *, health=None):
         default_channel_alias="artwork",
     )
     return build_router(
-        ingest=SimpleNamespace(),
+        ingest=ingest or SimpleNamespace(),
         jobs=jobs,
-        previews=SimpleNamespace(send=AsyncMock()),
-        translator=SimpleNamespace(),
+        previews=previews or SimpleNamespace(send=AsyncMock()),
+        translator=translator or SimpleNamespace(),
         health=health,
         wakeup=SimpleNamespace(set=Mock()),
         registry=SimpleNamespace(names=("pixiv", "deviantart", "direct")),
         settings=settings,
+    )
+
+
+def make_state() -> FSMContext:
+    return FSMContext(
+        storage=MemoryStorage(),
+        key=StorageKey(bot_id=1, chat_id=1, user_id=1),
+    )
+
+
+def make_post() -> SourcePost:
+    return SourcePost(
+        provider="direct",
+        source_id="image-1",
+        source_url="https://example.com/image.jpg",
+        normalized_url="https://example.com/image.jpg",
+        title="Image",
+        author_name="example.com",
+        author_url="https://example.com",
+        media_items=[MediaItem(
+            url="https://example.com/image.jpg", filename="image.jpg", order=0,
+        )],
     )
 
 
@@ -127,6 +156,7 @@ def test_main_menu_has_requested_persistent_layout():
     markup = main_menu_keyboard()
 
     assert [[button.text for button in row] for row in markup.keyboard] == [
+        [ADD_BUTTON],
         [QUEUE_BUTTON, PREVIEW_BUTTON],
         [STATS_BUTTON, CHANNELS_BUTTON],
         [HEALTH_BUTTON, HELP_BUTTON],
@@ -449,3 +479,130 @@ async def test_stats_button_runs_existing_stats_action():
     jobs.stats.assert_awaited_once()
     answer = next(request for request in bot.requests if isinstance(request, SendMessage))
     assert answer.text == "failed: 1\nqueued: 3"
+
+
+async def test_new_publication_button_starts_url_step():
+    router = make_router(SimpleNamespace())
+    bot = RecordingBot()
+    message = make_message(bot, ADD_BUTTON)
+    state = make_state()
+
+    await handler(router, "message", "new_publication")(message, state)
+
+    assert await state.get_state() == CreatePublication.waiting_for_urls.state
+    answer = next(request for request in bot.requests if isinstance(request, SendMessage))
+    assert answer.text.startswith("Шаг 1 из 3")
+    assert answer.reply_markup.inline_keyboard[0][0].callback_data == "wizard_cancel"
+
+
+async def test_plain_url_starts_wizard_and_requests_channel():
+    post = make_post()
+    ingest = SimpleNamespace(
+        parse=Mock(return_value=([post.source_url], [], None)),
+        fetch=AsyncMock(return_value=post),
+    )
+    translator = SimpleNamespace(enrich_title=AsyncMock())
+    jobs = SimpleNamespace(
+        ensure_user=AsyncMock(return_value=SimpleNamespace(id=12)),
+        channels=AsyncMock(return_value=make_channels()),
+    )
+    router = make_router(jobs, ingest=ingest, translator=translator)
+    bot = RecordingBot()
+    message = make_message(bot, post.source_url)
+    state = make_state()
+
+    await handler(router, "message", "submission")(message, state)
+
+    assert await state.get_state() == CreatePublication.waiting_for_channel.state
+    data = await state.get_data()
+    assert data["wizard_user_id"] == 12
+    assert data["wizard_posts"][0]["post"]["source_id"] == "image-1"
+    answers = [request for request in bot.requests if isinstance(request, SendMessage)]
+    assert answers[-1].text.startswith("Шаг 2 из 3")
+    assert [
+        button.callback_data
+        for row in answers[-1].reply_markup.inline_keyboard
+        for button in row
+    ] == ["wizard_channel:0:7", "wizard_cancel"]
+
+
+async def test_wizard_channel_selection_creates_editable_confirmation():
+    post = make_post()
+    channel = make_channels()[0]
+    created = SimpleNamespace(id=42)
+    stored = SimpleNamespace(
+        id=42,
+        post_data=serialize_post(post),
+        user_tags=[],
+        source_tags=[],
+        channel=channel,
+    )
+    jobs = SimpleNamespace(
+        channels=AsyncMock(return_value=[channel]),
+        create_preview=AsyncMock(return_value=created),
+        duplicate_state_for=AsyncMock(return_value=None),
+        get=AsyncMock(return_value=stored),
+    )
+    previews = SimpleNamespace(caption=AsyncMock(return_value="Final caption"))
+    router = make_router(jobs, previews=previews)
+    bot = RecordingBot()
+    message = make_message(bot, "choose channel")
+    callback = make_callback(bot, message, "wizard_channel:0:7")
+    state = make_state()
+    await state.set_state(CreatePublication.waiting_for_channel)
+    await state.set_data({
+        "wizard_user_id": 12,
+        "wizard_posts": [{"position": 1, "post": serialize_post(post)}],
+        "wizard_tags": [],
+        "wizard_total": 1,
+    })
+
+    await handler(router, "callback_query", "wizard_channel_selection")(callback, state)
+
+    assert await state.get_state() is None
+    jobs.create_preview.assert_awaited_once()
+    answers = [request for request in bot.requests if isinstance(request, SendMessage)]
+    assert "<b>Итоговая подпись</b>\nFinal caption" in answers[-1].text
+    callbacks = [
+        button.callback_data
+        for row in answers[-1].reply_markup.inline_keyboard
+        for button in row
+    ]
+    assert "caption:42" in callbacks
+    assert "publish:42" in callbacks
+
+
+async def test_custom_caption_is_saved_and_returned_to_confirmation():
+    post = make_post()
+    channel = make_channels()[0]
+    updated = SimpleNamespace(id=42)
+    stored = SimpleNamespace(
+        id=42,
+        post_data=serialize_post(post),
+        user_tags=[],
+        source_tags=[],
+        channel=channel,
+    )
+    jobs = SimpleNamespace(
+        set_caption_override=AsyncMock(return_value=updated),
+        get=AsyncMock(return_value=stored),
+    )
+    previews = SimpleNamespace(
+        validate_custom_caption=Mock(),
+        caption=AsyncMock(return_value="Custom &amp; safe"),
+    )
+    router = make_router(jobs, previews=previews)
+    bot = RecordingBot()
+    message = make_message(bot, "Custom & safe")
+    state = make_state()
+    await state.set_state(EditPreview.waiting_for_caption)
+    await state.set_data({"job_id": 42, "edit_context": "initial_preview"})
+
+    await handler(router, "message", "receive_caption")(message, state)
+
+    previews.validate_custom_caption.assert_called_once_with("Custom & safe")
+    jobs.set_caption_override.assert_awaited_once_with(42, "Custom & safe")
+    assert await state.get_state() is None
+    answers = [request for request in bot.requests if isinstance(request, SendMessage)]
+    assert "Custom &amp; safe" in answers[-1].text
+    assert answers[-1].parse_mode == "HTML"

@@ -1,14 +1,20 @@
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.bot.menu import (
+    ADD_BUTTON,
     BACK_CALLBACK,
     CHANNEL_CALLBACK_PREFIX,
     CHANNEL_PAGE_CALLBACK_PREFIX,
@@ -35,17 +41,23 @@ from app.bot.menu import (
     queue_menu_keyboard,
     render_help,
 )
-from app.bot.states import EditPreview
+from app.bot.states import CreatePublication, EditPreview
+from app.db.models import Channel, Job
 from app.domain.enums import JobStatus
 from app.domain.exceptions import ApplicationError
-from app.services.ingest_service import IngestService
+from app.domain.models import SourcePost
 from app.services.health_service import HealthService, render_health_report
-from app.services.job_service import JobService
-from app.services.preview_service import PreviewService
+from app.services.ingest_service import IngestService
+from app.services.job_service import JobService, serialize_post
+from app.services.preview_service import PreviewService, deserialize_post
 from app.services.translation_service import TranslationService
-from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.durations import format_duration, parse_duration
-from app.utils.queue_schedule import estimate_queue_schedule, format_countdown, next_queued_by_schedule
+from app.utils.queue_schedule import (
+    estimate_queue_schedule,
+    format_countdown,
+    next_queued_by_schedule,
+)
+from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.text import provider_label
 
 logger = logging.getLogger(__name__)
@@ -56,6 +68,7 @@ def preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Опубликовать", callback_data=f"publish:{job_id}")],
         [InlineKeyboardButton(text="Изменить теги", callback_data=f"tags:{job_id}"),
          InlineKeyboardButton(text="Сменить канал", callback_data=f"channel:{job_id}")],
+        [InlineKeyboardButton(text="Изменить подпись", callback_data=f"caption:{job_id}")],
         [InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{job_id}")],
     ])
 
@@ -72,6 +85,7 @@ def queued_preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Опубликовать сейчас", callback_data=f"preview_publish:{job_id}")],
         [InlineKeyboardButton(text="Заменить теги", callback_data=f"preview_tags_replace:{job_id}"),
          InlineKeyboardButton(text="Добавить теги", callback_data=f"preview_tags_add:{job_id}")],
+        [InlineKeyboardButton(text="Изменить подпись", callback_data=f"preview_caption:{job_id}")],
         [InlineKeyboardButton(text="Отменить публикацию", callback_data=f"preview_cancel:{job_id}")],
     ])
 
@@ -80,6 +94,38 @@ def cancel_tag_input_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Отмена ввода", callback_data=f"tags_input_cancel:{job_id}")],
     ])
+
+
+def caption_input_keyboard(job_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Использовать автоподпись", callback_data=f"caption_auto:{job_id}",
+        )],
+        [InlineKeyboardButton(
+            text="Отмена ввода", callback_data=f"caption_input_cancel:{job_id}",
+        )],
+    ])
+
+
+def wizard_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отменить создание", callback_data="wizard_cancel")],
+    ])
+
+
+def wizard_channel_keyboard(channels, page: int = 0) -> InlineKeyboardMarkup:
+    visible, page, page_count = paginate_channels(
+        [channel for channel in channels if channel.is_enabled], page,
+    )
+    rows = [[InlineKeyboardButton(
+        text=f"{channel.alias} — {channel.title}"[:64],
+        callback_data=f"wizard_channel:{page}:{channel.id}",
+    )] for channel in visible]
+    navigation = pagination_row(page, page_count, "wizard_channel_page:")
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="Отменить создание", callback_data="wizard_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def channel_selection_keyboard(
@@ -120,6 +166,137 @@ def build_router(
             return user_tags
         return merge_tags(user_tags, source_tags, settings.max_tags, settings.max_tag_length)
 
+    async def fetch_posts(
+        urls: list[str],
+    ) -> tuple[list[tuple[int, SourcePost]], list[tuple[str, str]]]:
+        posts: list[tuple[int, SourcePost]] = []
+        failures: list[tuple[str, str]] = []
+        for position, url in enumerate(urls, start=1):
+            try:
+                post = await ingest.fetch(url)
+                await translator.enrich_title(post)
+                posts.append((position, post))
+            except ApplicationError as error:
+                failures.append((url, str(error)))
+            except Exception as error:
+                logger.error(
+                    "batch_ingest_failed url=%s", url,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                failures.append((url, "Не удалось получить публикацию"))
+        return posts, failures
+
+    async def send_failures(message: Message, failures: list[tuple[str, str]], total: int) -> None:
+        if not failures:
+            return
+        details = "\n".join(f"• {escape(url)} — {escape(reason)}" for url, reason in failures)
+        await message.answer(
+            f"Не удалось обработать {len(failures)} из {total} ссылок:\n{details}",
+        )
+
+    async def confirmation_payload(
+        job: Job, *, position: int = 1, total: int = 1,
+    ) -> tuple[Job, str] | None:
+        stored = await jobs.get(job.id)
+        if stored is None:
+            return None
+        post = deserialize_post(stored.post_data)
+        combined_tags = effective_tags(stored.user_tags, stored.source_tags)
+        prefix = f"Ссылка {position}/{total}\n\n" if total > 1 else ""
+        caption = await previews.caption(stored)
+        return stored, (
+            prefix
+            + f"Источник: {escape(provider_label(post.provider))}\n"
+            + f"Автор: {escape(post.author_name)}\n"
+            + f"Название: {escape(post.title)}\n"
+            + f"Файлов: {len(post.media_items)}\n"
+            + f"Канал: {escape(stored.channel.alias)}\n\n"
+            + f"Теги: {hashtags(combined_tags) or '—'}\n\n"
+            + "<b>Итоговая подпись</b>\n"
+            + caption
+        )
+
+    async def send_confirmation(
+        message: Message, job: Job, *, position: int = 1, total: int = 1,
+        queued: bool = False,
+    ) -> None:
+        payload = await confirmation_payload(job, position=position, total=total)
+        if payload is None:
+            await message.answer(f"Не удалось открыть созданное задание #{job.id}.")
+            return
+        stored, text = payload
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=(
+                queued_preview_keyboard(stored.id) if queued else preview_keyboard(stored.id)
+            ),
+        )
+
+    async def create_preview_messages(
+        message: Message, user_id: int, posts: list[tuple[int, SourcePost]], channel: Channel,
+        tags: list[str], total: int,
+    ) -> None:
+        for position, post in posts:
+            job = await jobs.create_preview(
+                user_id, post, channel.id, tags, settings.max_job_attempts,
+            )
+            duplicate_state = await jobs.duplicate_state_for(
+                post.provider, post.source_id, channel.id, job.id,
+            )
+            prefix = f"Ссылка {position}/{total}\n\n" if total > 1 else ""
+            if duplicate_state:
+                duplicate_message = (
+                    f"Эта публикация уже была отправлена в канал {escape(channel.alias)}. "
+                    "Повторить публикацию?"
+                    if duplicate_state == "published"
+                    else f"Эта публикация уже ожидает обработку для канала {escape(channel.alias)}. "
+                    "Добавить её повторно?"
+                )
+                await message.answer(
+                    prefix + duplicate_message,
+                    reply_markup=duplicate_keyboard(job.id),
+                )
+                continue
+            await send_confirmation(message, job, position=position, total=total)
+
+    async def begin_wizard(
+        message: Message, state: FSMContext, urls: list[str], tags: list[str],
+    ) -> None:
+        await state.clear()
+        user = await jobs.ensure_user(
+            message.from_user.id, message.from_user.username, message.from_user.full_name,
+        )
+        await message.answer(
+            f"⏳ Шаг 1 из 3 · получаю данные по {len(urls)} "
+            f"{'ссылке' if len(urls) == 1 else 'ссылкам'}…",
+        )
+        posts, failures = await fetch_posts(urls)
+        await send_failures(message, failures, len(urls))
+        if not posts:
+            await state.clear()
+            return
+        channels = [channel for channel in await jobs.channels() if channel.is_enabled]
+        if not channels:
+            await state.clear()
+            await message.answer("Нет активных каналов для публикации.")
+            return
+        await state.set_state(CreatePublication.waiting_for_channel)
+        await state.set_data({
+            "wizard_user_id": user.id,
+            "wizard_posts": [
+                {"position": position, "post": serialize_post(post)}
+                for position, post in posts
+            ],
+            "wizard_tags": tags,
+            "wizard_total": len(urls),
+        })
+        await message.answer(
+            f"Шаг 2 из 3 · выберите канал для {len(posts)} "
+            f"{'публикации' if len(posts) == 1 else 'публикаций'}:",
+            reply_markup=wizard_channel_keyboard(channels),
+        )
+
     async def menu_callback_message(callback: CallbackQuery) -> Message | None:
         if isinstance(callback.message, Message):
             return callback.message
@@ -146,8 +323,112 @@ def build_router(
                 raise
 
     @router.message(Command("start", "menu"))
-    async def main_menu(message: Message) -> None:
+    async def main_menu(message: Message, state: FSMContext) -> None:
+        await state.clear()
         await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
+
+    @router.message(Command("new"))
+    @router.message(F.text == ADD_BUTTON)
+    async def new_publication(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await state.set_state(CreatePublication.waiting_for_urls)
+        await message.answer(
+            "Шаг 1 из 3 · отправьте одну или несколько ссылок на публикации.\n\n"
+            "Канал будет выбран на следующем шаге; дополнительные параметры вводить не нужно.",
+            reply_markup=wizard_cancel_keyboard(),
+        )
+
+    @router.message(CreatePublication.waiting_for_urls)
+    async def wizard_urls(message: Message, state: FSMContext) -> None:
+        try:
+            urls, tags, _ = ingest.parse(message.text or "")
+        except ApplicationError as error:
+            await message.answer(str(error), reply_markup=wizard_cancel_keyboard())
+            return
+        await begin_wizard(message, state, urls, tags)
+
+    @router.message(CreatePublication.waiting_for_channel)
+    async def wizard_waiting_for_channel(message: Message) -> None:
+        await message.answer(
+            "Выберите канал кнопкой под сообщением или отмените создание.",
+            reply_markup=wizard_cancel_keyboard(),
+        )
+
+    @router.callback_query(F.data == "wizard_cancel")
+    async def wizard_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None:
+            return
+        current_state = await state.get_state()
+        if current_state not in {
+            CreatePublication.waiting_for_urls.state,
+            CreatePublication.waiting_for_channel.state,
+        }:
+            await callback.answer("Этот мастер уже завершён.", show_alert=True)
+            return
+        await state.clear()
+        await message.edit_text("Создание публикации отменено.")
+        await callback.answer()
+
+    @router.callback_query(
+        CreatePublication.waiting_for_channel,
+        F.data.startswith("wizard_channel_page:"),
+    )
+    async def wizard_channel_page(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = parse_page(callback.data, "wizard_channel_page:")
+        if page is None:
+            await callback.answer("Некорректная страница.", show_alert=True)
+            return
+        channels = await jobs.channels()
+        await callback.answer()
+        await edit_menu_markup(message, wizard_channel_keyboard(channels, page))
+
+    @router.callback_query(
+        CreatePublication.waiting_for_channel,
+        F.data.startswith("wizard_channel:"),
+    )
+    async def wizard_channel_selection(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parsed = parse_paginated_selection(callback.data, "wizard_channel:")
+        if parsed is None or not parsed[1].isdigit():
+            await callback.answer("Некорректный канал.", show_alert=True)
+            return
+        channel_id = int(parsed[1])
+        channel = next(
+            (
+                item for item in await jobs.channels()
+                if item.id == channel_id and item.is_enabled
+            ),
+            None,
+        )
+        if channel is None:
+            await callback.answer("Канал удалён или отключён.", show_alert=True)
+            return
+        data = await state.get_data()
+        stored_posts = data.get("wizard_posts")
+        user_id = data.get("wizard_user_id")
+        if not isinstance(stored_posts, list) or not isinstance(user_id, int):
+            await state.clear()
+            await callback.answer("Мастер устарел. Начните создание заново.", show_alert=True)
+            return
+        posts = [
+            (int(item["position"]), deserialize_post(item["post"]))
+            for item in stored_posts
+        ]
+        tags = list(data.get("wizard_tags") or [])
+        total = int(data.get("wizard_total") or len(posts))
+        await state.clear()
+        await callback.answer("Создаю предпросмотр…")
+        await message.edit_text(
+            f"Шаг 3 из 3 · канал {escape(channel.alias)} выбран.\n\n"
+            "Проверьте итоговую подпись ниже. При необходимости измените её, затем нажмите «Опубликовать».",
+        )
+        await create_preview_messages(message, user_id, posts, channel, tags, total)
 
     async def show_help(message: Message) -> None:
         await message.answer(
@@ -251,7 +532,7 @@ def build_router(
                 f"Очередь канала {escape(alias)} пуста."
                 if alias else "Очередь пуста."
             )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         schedule = estimate_queue_schedule(rows, now)
         lines = [
             f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {format_countdown(estimate, now)}"
@@ -484,6 +765,67 @@ def build_router(
         await callback.message.edit_text(prompt, reply_markup=cancel_tag_input_keyboard(job_id))
         await callback.answer()
 
+    @router.callback_query(F.data.startswith("caption:") | F.data.startswith("preview_caption:"))
+    async def edit_caption(callback: CallbackQuery, state: FSMContext) -> None:
+        is_queued = callback.data.startswith("preview_caption:")
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        job = await jobs.get(job_id)
+        expected_status = JobStatus.QUEUED if is_queued else JobStatus.WAITING_CONFIRMATION
+        if not job or job.status != expected_status:
+            await callback.answer("Подпись этого задания уже нельзя изменить.", show_alert=True)
+            return
+        current_caption = await previews.caption(job)
+        await state.set_state(EditPreview.waiting_for_caption)
+        await state.set_data({
+            "job_id": job_id,
+            "edit_context": "queued_preview" if is_queued else "initial_preview",
+        })
+        await callback.message.answer(
+            "<b>Текущая подпись</b>\n"
+            f"{current_caption}\n\n"
+            "Отправьте новую подпись обычным текстом. Максимум — 1024 символа.",
+            parse_mode="HTML",
+            reply_markup=caption_input_keyboard(job_id),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("caption_auto:"))
+    async def restore_automatic_caption(callback: CallbackQuery, state: FSMContext) -> None:
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        context = data.get("edit_context")
+        job = await jobs.set_caption_override(job_id, None)
+        if job is None:
+            await callback.answer("Подпись этого задания уже нельзя изменить.", show_alert=True)
+            return
+        await state.clear()
+        await callback.message.edit_text("Автоматическая подпись восстановлена.")
+        await send_confirmation(
+            callback.message, job, queued=context == "queued_preview",
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("caption_input_cancel:"))
+    async def cancel_caption_input(callback: CallbackQuery, state: FSMContext) -> None:
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        if (
+            await state.get_state() != EditPreview.waiting_for_caption.state
+            or data.get("job_id") != job_id
+        ):
+            await callback.answer("Редактирование подписи уже завершено.", show_alert=True)
+            return
+        await state.clear()
+        keyboard = (
+            queued_preview_keyboard(job_id)
+            if data.get("edit_context") == "queued_preview"
+            else preview_keyboard(job_id)
+        )
+        await callback.message.edit_text(
+            "Изменение подписи отменено.", reply_markup=keyboard,
+        )
+        await callback.answer()
+
     @router.callback_query(F.data.startswith("preview_cancel:"))
     async def cancel_from_preview(callback: CallbackQuery, state: FSMContext) -> None:
         job_id = int(callback.data.rsplit(":", 1)[1])
@@ -676,8 +1018,15 @@ def build_router(
         if not channel:
             await callback.answer("Канал недоступен или предпросмотр уже закрыт.", show_alert=True)
             return
-        updated_text = replace_channel_line(callback.message.text or "", channel.alias)
-        await callback.message.edit_text(updated_text, reply_markup=preview_keyboard(job_id))
+        updated_job = await jobs.get(job_id)
+        payload = await confirmation_payload(updated_job) if updated_job is not None else None
+        if payload is None:
+            await callback.answer("Не удалось обновить предпросмотр.", show_alert=True)
+            return
+        _, updated_text = payload
+        await callback.message.edit_text(
+            updated_text, parse_mode="HTML", reply_markup=preview_keyboard(job_id),
+        )
         await callback.answer(f"Выбран канал: {channel.alias}")
 
     @router.callback_query(F.data.startswith("channel_select_cancel:"))
@@ -733,11 +1082,40 @@ def build_router(
             reply_markup=queued_preview_keyboard(job.id),
         )
 
+    @router.message(EditPreview.waiting_for_caption)
+    async def receive_caption(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        job_id = data.get("job_id")
+        if not isinstance(job_id, int):
+            await state.clear()
+            await message.answer("Редактирование подписи устарело. Откройте предпросмотр заново.")
+            return
+        value = (message.text or "").strip()
+        try:
+            previews.validate_custom_caption(value)
+        except ApplicationError as error:
+            await message.answer(str(error), reply_markup=caption_input_keyboard(job_id))
+            return
+        job = await jobs.set_caption_override(job_id, value)
+        if job is None:
+            await state.clear()
+            await message.answer("Подпись этого задания уже нельзя изменить.")
+            return
+        queued = data.get("edit_context") == "queued_preview"
+        await state.clear()
+        await message.answer("Подпись обновлена. Проверьте итоговый вариант:")
+        await send_confirmation(message, job, queued=queued)
+
     @router.message(F.text)
-    async def submission(message: Message) -> None:
-        user = await jobs.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    async def submission(message: Message, state: FSMContext) -> None:
         try:
             urls, tags, alias = ingest.parse(message.text)
+            if alias is None and not tags:
+                await begin_wizard(message, state, urls, tags)
+                return
+            user = await jobs.ensure_user(
+                message.from_user.id, message.from_user.username, message.from_user.full_name,
+            )
             channel = (
                 await jobs.get_channel(alias)
                 if alias
@@ -746,48 +1124,11 @@ def build_router(
             if not channel:
                 await message.answer("Канал не найден или отключён. Проверьте --channel и CHANNELS_JSON.")
                 return
-            failures: list[tuple[str, str]] = []
-            for position, url in enumerate(urls, start=1):
-                try:
-                    post = await ingest.fetch(url)
-                    await translator.enrich_title(post)
-                except ApplicationError as error:
-                    failures.append((url, str(error)))
-                    continue
-                except Exception as error:
-                    logger.error(
-                        "batch_ingest_failed url=%s", url,
-                        exc_info=(type(error), error, error.__traceback__),
-                    )
-                    failures.append((url, "Не удалось получить публикацию"))
-                    continue
-                job = await jobs.create_preview(user.id, post, channel.id, tags, settings.max_job_attempts)
-                combined_tags = effective_tags(tags, post.source_tags)
-                prefix = f"Ссылка {position}/{len(urls)}\n\n" if len(urls) > 1 else ""
-                duplicate_state = await jobs.duplicate_state_for(
-                    post.provider, post.source_id, channel.id, job.id,
-                )
-                if duplicate_state:
-                    duplicate_message = (
-                        f"Эта публикация уже была отправлена в канал {escape(channel.alias)}. "
-                        "Повторить публикацию?"
-                        if duplicate_state == "published"
-                        else f"Эта публикация уже ожидает обработки для канала {escape(channel.alias)}. "
-                        "Добавить её повторно?"
-                    )
-                    await message.answer(
-                        prefix + duplicate_message,
-                        reply_markup=duplicate_keyboard(job.id),
-                    )
-                    continue
-                await message.answer(
-                    prefix + f"Источник: {escape(provider_label(post.provider))}\nАвтор: {escape(post.author_name)}\n"
-                    f"Название: {escape(post.title)}\nФайлов: {len(post.media_items)}\nКанал: {escape(channel.alias)}\n\n"
-                    f"Теги: {hashtags(combined_tags) or '—'}", reply_markup=preview_keyboard(job.id)
-                )
-            if failures:
-                details = "\n".join(f"• {escape(url)} — {escape(reason)}" for url, reason in failures)
-                await message.answer(f"Не удалось обработать {len(failures)} из {len(urls)} ссылок:\n{details}")
+            posts, failures = await fetch_posts(urls)
+            await create_preview_messages(
+                message, user.id, posts, channel, tags, len(urls),
+            )
+            await send_failures(message, failures, len(urls))
         except ApplicationError as error:
             await message.answer(str(error))
         except Exception:

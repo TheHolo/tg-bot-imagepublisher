@@ -1,5 +1,4 @@
 import asyncio
-
 from datetime import timedelta
 
 from app.db.models import Channel, Job, Publication, User, utcnow
@@ -247,6 +246,35 @@ async def test_last_selected_channel_is_reused_and_can_be_changed(tmp_path):
 
     preferred = await jobs.get_preferred_channel(user_id, "artwork")
     assert preferred is not None and preferred.id == arknights_id
+    await engine.dispose()
+
+
+async def test_caption_override_can_be_changed_before_and_after_enqueue(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'caption.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(alias="artwork", telegram_chat_id="-1001", title="Artwork")
+        session.add_all([user, channel])
+        await session.flush()
+        user_id, channel_id = user.id, channel.id
+
+    post = SourcePost(
+        provider="direct", source_id="caption", source_url="https://x/a.jpg",
+        normalized_url="https://x/a.jpg", title="A", author_name="Unknown",
+        author_url="https://x", media_items=[],
+    )
+    jobs = JobService(sessions)
+    job = await jobs.create_preview(user_id, post, channel_id, [], 3)
+
+    assert await jobs.set_caption_override(job.id, "Custom caption") is not None
+    stored = await jobs.get(job.id)
+    assert stored is not None and stored.caption_override == "Custom caption"
+
+    assert await jobs.enqueue(job.id)
+    assert await jobs.set_caption_override(job.id, None) is not None
+    stored = await jobs.get(job.id)
+    assert stored is not None and stored.caption_override is None
     await engine.dispose()
 
 

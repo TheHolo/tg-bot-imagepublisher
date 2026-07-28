@@ -47,6 +47,11 @@ from app.db.models import Channel, Job
 from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
 from app.domain.exceptions import ApplicationError
 from app.domain.models import SourcePost
+from app.services.channel_stats_service import (
+    ChannelStatsService,
+    ChannelSubscriberStats,
+    SubscriberChange,
+)
 from app.services.health_service import HealthService, render_health_report
 from app.services.ingest_service import IngestService
 from app.services.job_service import QUEUE_FILTER_STATUSES, JobService, serialize_post
@@ -63,6 +68,35 @@ from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.text import provider_label
 
 logger = logging.getLogger(__name__)
+
+
+def format_subscriber_change(change: SubscriberChange | None) -> str:
+    if change is None:
+        return "—"
+    value = f"{change.value:+,}".replace(",", " ")
+    if change.percent is None:
+        return value
+    percent = f"{change.percent:+.2f}".replace(".", ",")
+    return f"{value} ({percent}%)"
+
+
+def render_channel_subscriber_stats(stats: ChannelSubscriberStats) -> str:
+    if stats.count is None:
+        lines = ["Подписчики: —"]
+    else:
+        count = f"{stats.count:,}".replace(",", " ")
+        lines = [
+            f"Подписчики: <b>{count}</b>",
+            (
+                "Изменение: "
+                f"24ч {format_subscriber_change(stats.day)} · "
+                f"7д {format_subscriber_change(stats.week)} · "
+                f"30д {format_subscriber_change(stats.month)}"
+            ),
+        ]
+    if stats.error:
+        lines.append(f"Обновление подписчиков: ⚠️ {escape(stats.error)}")
+    return "\n".join(lines)
 
 
 def preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
@@ -317,7 +351,8 @@ def queue_summary_line(post_count: int, completion: datetime, now: datetime) -> 
 
 def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
-    translator: TranslationService, health: HealthService, wakeup, registry, settings,
+    translator: TranslationService, health: HealthService,
+    channel_stats: ChannelStatsService, wakeup, registry, settings,
 ) -> Router:
     router = Router()
 
@@ -347,7 +382,9 @@ def build_router(
             )
             return f"❌ проверка не выполнена · {escape(type(error).__name__)}"
 
-    async def channel_details_text(channel: Channel, bot) -> str:
+    async def channel_details_text(
+        channel: Channel, bot, *, capture_subscribers: bool = False,
+    ) -> str:
         rows = await jobs.managed_queue(channel.id, "active", limit=None)
         queued_count = sum(job.status == JobStatus.QUEUED for job in rows)
         processing_count = len(rows) - queued_count
@@ -368,6 +405,12 @@ def build_router(
             channel_status = "🟢 активен"
         default = " · основной" if channel.is_default else ""
         rights = await channel_permission_text(channel, bot)
+        subscriber_stats = (
+            await channel_stats.capture_for_display(channel)
+            if capture_subscribers
+            else await channel_stats.summary(channel.id)
+        )
+        subscribers = render_channel_subscriber_stats(subscriber_stats)
         return (
             f"📡 <b>{escape(channel.title)}</b> · <code>{escape(channel.alias)}</code>{default}\n\n"
             f"Статус: {channel_status}\n"
@@ -375,11 +418,17 @@ def build_router(
             f"Ближайшая публикация: {nearest_text}\n"
             f"Режим: <code>{escape(channel.publish_mode)}</code>\n"
             f"Интервал: {format_duration(channel.publish_interval_seconds)}\n"
+            f"{subscribers}\n"
             f"Права бота: {rights}"
         )
 
-    async def edit_channel_screen(message: Message, channel: Channel, page: int) -> None:
-        text = await channel_details_text(channel, message.bot)
+    async def edit_channel_screen(
+        message: Message, channel: Channel, page: int, *,
+        capture_subscribers: bool = False,
+    ) -> None:
+        text = await channel_details_text(
+            channel, message.bot, capture_subscribers=capture_subscribers,
+        )
         try:
             await message.edit_text(
                 text, parse_mode="HTML", reply_markup=channel_details_keyboard(channel, page),
@@ -814,8 +863,10 @@ def build_router(
         if channel is None:
             await callback.answer("Канал больше не существует.", show_alert=True)
             return
-        await callback.answer("Проверяю права бота…")
-        await edit_channel_screen(message, channel, page)
+        await callback.answer("Обновляю данные канала…")
+        await edit_channel_screen(
+            message, channel, page, capture_subscribers=True,
+        )
 
     @router.callback_query(F.data.startswith("channel_refresh:"))
     async def refresh_channel_details(callback: CallbackQuery) -> None:
@@ -828,7 +879,9 @@ def build_router(
             await callback.answer("Канал больше не существует.", show_alert=True)
             return
         await callback.answer("Обновляю…")
-        await edit_channel_screen(message, channel, int(raw_page))
+        await edit_channel_screen(
+            message, channel, int(raw_page), capture_subscribers=True,
+        )
 
     @router.callback_query(F.data.startswith("channel_back:"))
     async def channel_details_back(callback: CallbackQuery) -> None:

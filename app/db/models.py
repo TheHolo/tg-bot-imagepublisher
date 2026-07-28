@@ -1,10 +1,12 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -52,6 +54,27 @@ class Channel(Base):
     caption_template: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ChannelMemberSnapshot(Base):
+    __tablename__ = "channel_member_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_id", "source", "snapshot_date",
+            name="uq_channel_member_snapshot_daily_source",
+        ),
+        Index(
+            "ix_channel_member_snapshots_channel_captured",
+            "channel_id", "captured_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"), index=True)
+    member_count: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(16))
+    snapshot_date: Mapped[date | None] = mapped_column(Date)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Job(Base):

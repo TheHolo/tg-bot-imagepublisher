@@ -104,8 +104,18 @@ def make_callback(bot: RecordingBot, message: Message, data: str) -> CallbackQue
     ).as_(bot)
 
 
-def make_router(jobs, *, health=None, ingest=None, previews=None, translator=None):
+def make_router(
+    jobs, *, health=None, channel_stats=None, ingest=None, previews=None,
+    translator=None,
+):
     health = health or SimpleNamespace(check=AsyncMock())
+    empty_subscriber_stats = SimpleNamespace(
+        count=None, captured_at=None, day=None, week=None, month=None, error=None,
+    )
+    channel_stats = channel_stats or SimpleNamespace(
+        capture_for_display=AsyncMock(return_value=empty_subscriber_stats),
+        summary=AsyncMock(return_value=empty_subscriber_stats),
+    )
     settings = SimpleNamespace(
         auto_add_source_tags=True,
         max_tags=20,
@@ -120,6 +130,7 @@ def make_router(jobs, *, health=None, ingest=None, previews=None, translator=Non
         previews=previews or SimpleNamespace(send=AsyncMock()),
         translator=translator or SimpleNamespace(),
         health=health,
+        channel_stats=channel_stats,
         wakeup=SimpleNamespace(set=Mock()),
         registry=SimpleNamespace(names=("pixiv", "deviantart", "direct")),
         settings=settings,
@@ -365,6 +376,42 @@ async def test_queue_callback_opens_filtered_management_screen():
     assert "queue_filter:1:12:active" in [
         button.callback_data for button in flatten(edit.reply_markup)
     ]
+
+
+async def test_opening_registered_channel_captures_and_renders_subscribers():
+    channel = make_channels()[0]
+    channel.publish_mode = "auto"
+    channel.publish_interval_seconds = 0
+    channel.is_paused = False
+    channel.is_default = True
+    jobs = SimpleNamespace(
+        get_channel_by_id=AsyncMock(return_value=channel),
+        managed_queue=AsyncMock(return_value=[]),
+    )
+    subscriber_stats = SimpleNamespace(
+        count=1234,
+        captured_at=datetime.now(UTC),
+        day=SimpleNamespace(value=12, percent=0.98),
+        week=SimpleNamespace(value=-5, percent=-0.4),
+        month=None,
+        error=None,
+    )
+    channel_stats = SimpleNamespace(
+        capture_for_display=AsyncMock(return_value=subscriber_stats),
+        summary=AsyncMock(return_value=subscriber_stats),
+    )
+    router = make_router(jobs, channel_stats=channel_stats)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "menu:channel:0:7")
+
+    await handler(router, "callback_query", "registered_channel_details")(callback)
+
+    channel_stats.capture_for_display.assert_awaited_once_with(channel)
+    edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
+    assert "Подписчики: <b>1 234</b>" in edit.text
+    assert "24ч +12 (+0,98%)" in edit.text
+    assert "7д -5 (-0,40%)" in edit.text
+    assert "30д —" in edit.text
 
 
 async def test_queue_page_callback_replaces_markup_with_requested_page():

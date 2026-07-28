@@ -19,6 +19,7 @@ from app.providers.pixiv import PixivProvider
 from app.providers.registry import ProviderRegistry
 from app.queue.worker import WorkerPool
 from app.services.caption_service import CaptionService
+from app.services.channel_stats_service import ChannelStatsService
 from app.services.download_service import DownloadService
 from app.services.health_service import HealthService
 from app.services.ingest_service import IngestService
@@ -37,13 +38,16 @@ class Application:
     http: aiohttp.ClientSession
     engine: object
     workers: WorkerPool
+    channel_stats: ChannelStatsService
 
     async def run(self) -> None:
         try:
             await configure_bot_ui(self.bot)
             await self.workers.start()
+            await self.channel_stats.start()
             await self.dispatcher.start_polling(self.bot, allowed_updates=self.dispatcher.resolve_used_update_types())
         finally:
+            await self.channel_stats.stop()
             await self.workers.stop()
             await self.http.close()
             await self.bot.session.close()
@@ -109,13 +113,20 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         bot=bot, sessions=sessions, workers=workers, storage=settings.storage_path,
         registry=registry, database_url=settings.database_url,
     )
+    channel_stats = ChannelStatsService(
+        bot=bot, sessions=sessions, admin_ids=settings.admin_ids,
+        timezone_name=settings.timezone,
+    )
     dispatcher = Dispatcher(storage=MemoryStorage())
     middleware = AdminOnlyMiddleware(settings.admin_ids)
-    router = build_router(ingest, jobs, previews, translator, health, wakeup, registry, settings)
+    router = build_router(
+        ingest, jobs, previews, translator, health, channel_stats,
+        wakeup, registry, settings,
+    )
     router.message.outer_middleware(middleware)
     router.callback_query.outer_middleware(middleware)
     dispatcher.include_router(router)
-    return Application(settings, bot, dispatcher, http, engine, workers)
+    return Application(settings, bot, dispatcher, http, engine, workers, channel_stats)
 
 
 async def _sync_channels(sessions, settings: Settings) -> None:

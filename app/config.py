@@ -1,11 +1,11 @@
 import json
-from pathlib import Path
 import tomllib
+from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-
 
 REPOSITORY_SETTING_FIELDS = {
     "storage_path",
@@ -24,6 +24,7 @@ REPOSITORY_SETTING_FIELDS = {
     "translation_timeout",
     "delete_files_after_publish",
     "files_ttl_hours",
+    "timezone",
 }
 
 
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
     translation_timeout: int = Field(5, ge=1, le=30)
     delete_files_after_publish: bool = True
     files_ttl_hours: int = 24
+    timezone: str = "UTC"
 
     def __init__(self, _config_file: str | Path = "bot-settings.toml", **values: Any) -> None:
         repository_values: dict[str, Any] = {}
@@ -97,6 +99,15 @@ class Settings(BaseSettings):
                 raise ValueError("each channel must have a string alias and an object value")
             channels[alias] = settings
         return channels
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError(f"unknown IANA timezone: {value}") from error
+        return value
 
     @property
     def max_download_bytes(self) -> int:

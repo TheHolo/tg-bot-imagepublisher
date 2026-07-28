@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.db.models import Job
 from app.domain.enums import JobStatus
@@ -13,7 +13,7 @@ IN_PROGRESS_STATUSES = {
 
 def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> list[tuple[Job, datetime]]:
     """Estimate publication slots independently for each channel."""
-    now = _aware_utc(now or datetime.now(timezone.utc))
+    now = _aware_utc(now or datetime.now(UTC))
     grouped: dict[str, list[Job]] = defaultdict(list)
     for job in jobs:
         grouped[job.channel.alias].append(job)
@@ -41,10 +41,28 @@ def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> lis
             # A manual/in-progress publication resets this channel's old timer.
             next_channel_slot = latest_immediate + interval
 
-        for job in regular_jobs:
-            estimate = max(next_channel_slot, _aware_utc(job.next_attempt_at or now))
-            result.append((job, estimate))
-            next_channel_slot = estimate + interval
+        pending = list(regular_jobs)
+        while pending:
+            available = [
+                job for job in pending
+                if _job_available_at(job, now) <= next_channel_slot
+            ]
+            if not available:
+                next_channel_slot = min(_job_available_at(job, now) for job in pending)
+                available = [
+                    job for job in pending
+                    if _job_available_at(job, now) <= next_channel_slot
+                ]
+            job = min(
+                available,
+                key=lambda item: (
+                    getattr(item, "scheduled_at", None) is None,
+                    _job_priority(item),
+                ),
+            )
+            result.append((job, next_channel_slot))
+            pending.remove(job)
+            next_channel_slot += interval
 
     # Merge independently calculated channel schedules into one chronological
     # queue. This keeps /queue useful when one channel has many more jobs than
@@ -76,7 +94,7 @@ def next_queued_by_schedule(
 
 
 def format_countdown(target: datetime, now: datetime | None = None) -> str:
-    now = _aware_utc(now or datetime.now(timezone.utc))
+    now = _aware_utc(now or datetime.now(UTC))
     seconds = max(0, round((_aware_utc(target) - now).total_seconds()))
     if seconds == 0:
         return "сейчас"
@@ -95,17 +113,32 @@ def format_countdown(target: datetime, now: datetime | None = None) -> str:
     return "через " + " ".join(parts)
 
 
-def _job_priority(job: Job) -> tuple[int, datetime, int]:
+def _job_priority(job: Job) -> tuple[int, int, int, datetime, int]:
     if job.status in IN_PROGRESS_STATUSES:
         priority = 0
     elif job.force_publish:
         priority = 1
     else:
         priority = 2
-    return priority, _aware_utc(job.created_at), job.id
+    queue_position = getattr(job, "queue_position", None)
+    return (
+        priority,
+        queue_position is None,
+        queue_position or 0,
+        _aware_utc(job.created_at),
+        job.id,
+    )
+
+
+def _job_available_at(job: Job, now: datetime) -> datetime:
+    return max(
+        now,
+        _aware_utc(job.next_attempt_at or now),
+        _aware_utc(getattr(job, "scheduled_at", None) or now),
+    )
 
 
 def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

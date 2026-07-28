@@ -112,6 +112,7 @@ def make_router(jobs, *, health=None, ingest=None, previews=None, translator=Non
         max_tag_length=64,
         max_job_attempts=3,
         default_channel_alias="artwork",
+        timezone="Asia/Vladivostok",
     )
     return build_router(
         ingest=ingest or SimpleNamespace(),
@@ -342,10 +343,12 @@ async def test_configure_bot_ui_registers_commands_and_command_menu_button():
     )
 
 
-async def test_queue_callback_runs_alias_filtered_queue_and_keeps_menu():
+async def test_queue_callback_opens_filtered_management_screen():
+    channels = make_many_channels(12)
     jobs = SimpleNamespace(
-        channels=AsyncMock(return_value=make_many_channels(12)),
-        queue=AsyncMock(return_value=[]),
+        channels=AsyncMock(return_value=channels),
+        get_channel_by_id=AsyncMock(return_value=channels[-1]),
+        managed_queue=AsyncMock(return_value=[]),
     )
     router = make_router(jobs)
     bot = RecordingBot()
@@ -353,16 +356,14 @@ async def test_queue_callback_runs_alias_filtered_queue_and_keeps_menu():
 
     await handler(router, "callback_query", "queue_menu_selection")(callback)
 
-    jobs.queue.assert_awaited_once_with("channel-12", limit=None)
+    jobs.get_channel_by_id.assert_awaited_once_with(12)
+    jobs.managed_queue.assert_awaited_once_with(12, "active", limit=None)
     assert any(isinstance(request, AnswerCallbackQuery) for request in bot.requests)
     edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
-    assert edit.text == "Очередь канала channel-12 пуста."
-    assert [button.callback_data for button in flatten(edit.reply_markup)] == [
-        "menu:queue:1:all",
-        "menu:queue:1:11",
-        "menu:queue:1:12",
-        "menu:queue_page:0",
-        BACK_CALLBACK,
+    assert "Очередь: channel-12" in edit.text
+    assert "Заданий с таким статусом нет" in edit.text
+    assert "queue_filter:1:12:active" in [
+        button.callback_data for button in flatten(edit.reply_markup)
     ]
 
 

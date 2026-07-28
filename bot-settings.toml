@@ -18,3 +18,4 @@ pixiv_max_images = 10
 
 delete_files_after_publish = true
 files_ttl_hours = 24
+timezone = "Asia/Vladivostok"

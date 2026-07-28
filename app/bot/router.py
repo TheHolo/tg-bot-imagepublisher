@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import UTC, datetime
 from html import escape
@@ -41,16 +42,17 @@ from app.bot.menu import (
     queue_menu_keyboard,
     render_help,
 )
-from app.bot.states import CreatePublication, EditPreview
+from app.bot.states import CreatePublication, EditPreview, ManageChannel, ManageQueue
 from app.db.models import Channel, Job
-from app.domain.enums import JobStatus
+from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
 from app.domain.exceptions import ApplicationError
 from app.domain.models import SourcePost
 from app.services.health_service import HealthService, render_health_report
 from app.services.ingest_service import IngestService
-from app.services.job_service import JobService, serialize_post
+from app.services.job_service import QUEUE_FILTER_STATUSES, JobService, serialize_post
 from app.services.preview_service import PreviewService, deserialize_post
 from app.services.translation_service import TranslationService
+from app.utils.datetime_input import format_schedule_datetime, parse_schedule_datetime
 from app.utils.durations import format_duration, parse_duration
 from app.utils.queue_schedule import (
     estimate_queue_schedule,
@@ -68,7 +70,10 @@ def preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Опубликовать", callback_data=f"publish:{job_id}")],
         [InlineKeyboardButton(text="Изменить теги", callback_data=f"tags:{job_id}"),
          InlineKeyboardButton(text="Сменить канал", callback_data=f"channel:{job_id}")],
+        [InlineKeyboardButton(text="Изменить заголовок", callback_data=f"title:{job_id}"),
+         InlineKeyboardButton(text="Изменить описание", callback_data=f"description:{job_id}")],
         [InlineKeyboardButton(text="Изменить подпись", callback_data=f"caption:{job_id}")],
+        [InlineKeyboardButton(text="Показать медиа", callback_data=f"media:{job_id}")],
         [InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{job_id}")],
     ])
 
@@ -103,6 +108,161 @@ def caption_input_keyboard(job_id: int) -> InlineKeyboardMarkup:
         )],
         [InlineKeyboardButton(
             text="Отмена ввода", callback_data=f"caption_input_cancel:{job_id}",
+        )],
+    ])
+
+
+def post_field_input_keyboard(job_id: int, field: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Отмена ввода", callback_data=f"post_field_cancel:{field}:{job_id}",
+        )],
+    ])
+
+
+def channel_details_keyboard(channel: Channel, page: int) -> InlineKeyboardMarkup:
+    pause_text = "▶️ Возобновить" if channel.is_paused else "⏸ Приостановить"
+    rows = [
+        [InlineKeyboardButton(
+            text=pause_text, callback_data=f"channel_pause:{page}:{channel.id}",
+        )],
+        [InlineKeyboardButton(
+            text="⏱ Изменить интервал",
+            callback_data=f"channel_interval_edit:{page}:{channel.id}",
+        )],
+        [InlineKeyboardButton(
+            text="⭐ Сделать основным",
+            callback_data=f"channel_default:{page}:{channel.id}",
+        )],
+        [InlineKeyboardButton(
+            text="🚀 Опубликовать следующий",
+            callback_data=f"channel_publish:{page}:{channel.id}",
+        )],
+        [InlineKeyboardButton(
+            text="🔄 Обновить", callback_data=f"channel_refresh:{page}:{channel.id}",
+        )],
+        [InlineKeyboardButton(text="⬅️ К списку каналов", callback_data=f"channel_back:{page}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def channel_interval_input_keyboard(channel_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Отмена", callback_data=f"channel_interval_cancel:{page}:{channel_id}",
+        )],
+    ])
+
+
+QUEUE_FILTER_LABELS = {
+    "active": "Активные",
+    "queued": "Ожидают",
+    "processing": "В работе",
+    "failed": "Ошибки",
+    "completed": "Готово",
+    "cancelled": "Отменено",
+}
+
+
+def queue_view_keyboard(
+    rows: list[Job], *, page: int, scope: int, status_filter: str,
+) -> InlineKeyboardMarkup:
+    filter_buttons = [
+        InlineKeyboardButton(
+            text=f"{'✓ ' if key == status_filter else ''}{label}",
+            callback_data=f"queue_filter:{page}:{scope}:{key}",
+        )
+        for key, label in QUEUE_FILTER_LABELS.items()
+    ]
+    buttons = [filter_buttons[:3], filter_buttons[3:]]
+    buttons.extend([
+        [InlineKeyboardButton(
+            text=f"#{job.id} · {job.status} · {job.channel.alias}"[:64],
+            callback_data=f"queue_job:{page}:{scope}:{status_filter}:{job.id}",
+        )]
+        for job in rows[:15]
+    ])
+    if rows and status_filter not in {"completed", "cancelled"}:
+        buttons.append([InlineKeyboardButton(
+            text="🗑 Отменить выбранные",
+            callback_data=f"queue_bulk_prompt:cancel:{page}:{scope}:{status_filter}",
+        )])
+    if status_filter == "failed":
+        buttons.append([InlineKeyboardButton(
+            text="🔁 Повторить все неудачные",
+            callback_data=f"queue_bulk_prompt:retry:{page}:{scope}:{status_filter}",
+        )])
+    buttons.extend([
+        [InlineKeyboardButton(
+            text="🔄 Обновить", callback_data=f"queue_filter:{page}:{scope}:{status_filter}",
+        )],
+        [InlineKeyboardButton(text="⬅️ К выбору канала", callback_data=f"queue_back:{page}")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def queue_job_keyboard(
+    job: Job, *, page: int, scope: int, status_filter: str,
+) -> InlineKeyboardMarkup:
+    context = f"{page}:{scope}:{status_filter}:{job.id}"
+    rows: list[list[InlineKeyboardButton]] = []
+    if job.status == JobStatus.QUEUED:
+        rows.extend([
+            [
+                InlineKeyboardButton(text="⬆️ Выше", callback_data=f"queue_move:{context}:up"),
+                InlineKeyboardButton(text="⬇️ Ниже", callback_data=f"queue_move:{context}:down"),
+            ],
+            [InlineKeyboardButton(
+                text="🕒 Назначить точное время", callback_data=f"queue_schedule:{context}",
+            )],
+        ])
+        if job.scheduled_at is not None:
+            rows.append([InlineKeyboardButton(
+                text="Сбросить точное время", callback_data=f"queue_schedule_clear:{context}",
+            )])
+        rows.extend([
+            [InlineKeyboardButton(
+                text="🚀 Опубликовать сейчас", callback_data=f"queue_force:{context}",
+            )],
+            [InlineKeyboardButton(
+                text="🖼 Показать медиа", callback_data=f"queue_job_preview:{context}",
+            )],
+        ])
+    if job.status == JobStatus.FAILED:
+        rows.append([InlineKeyboardButton(
+            text="🔁 Повторить", callback_data=f"queue_retry:{context}",
+        )])
+    if job.status not in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
+        rows.append([InlineKeyboardButton(
+            text="🗑 Отменить", callback_data=f"queue_cancel_job:{context}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К очереди", callback_data=f"queue_filter:{page}:{scope}:{status_filter}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_input_keyboard(
+    job_id: int, *, page: int, scope: int, status_filter: str,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Отмена",
+            callback_data=f"queue_schedule_cancel:{page}:{scope}:{status_filter}:{job_id}",
+        )],
+    ])
+
+
+def bulk_confirmation_keyboard(
+    action: str, *, page: int, scope: int, status_filter: str,
+) -> InlineKeyboardMarkup:
+    context = f"{action}:{page}:{scope}:{status_filter}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Подтвердить", callback_data=f"queue_bulk_confirm:{context}",
+        )],
+        [InlineKeyboardButton(
+            text="Отмена", callback_data=f"queue_filter:{page}:{scope}:{status_filter}",
         )],
     ])
 
@@ -165,6 +325,169 @@ def build_router(
         if not settings.auto_add_source_tags:
             return user_tags
         return merge_tags(user_tags, source_tags, settings.max_tags, settings.max_tag_length)
+
+    async def channel_permission_text(channel: Channel, bot) -> str:
+        try:
+            me = await asyncio.wait_for(bot.get_me(), timeout=5)
+            member = await asyncio.wait_for(
+                bot.get_chat_member(channel.telegram_chat_id, me.id), timeout=5,
+            )
+            member_status = getattr(member.status, "value", str(member.status))
+            can_post = member_status == "creator" or (
+                member_status == "administrator"
+                and bool(getattr(member, "can_post_messages", False))
+            )
+            return (
+                f"{'✅' if can_post else '❌'} {escape(member_status)} · "
+                f"{'может публиковать' if can_post else 'нет права публикации'}"
+            )
+        except Exception as error:
+            logger.warning(
+                "channel_permission_check_failed channel=%s", channel.alias, exc_info=True,
+            )
+            return f"❌ проверка не выполнена · {escape(type(error).__name__)}"
+
+    async def channel_details_text(channel: Channel, bot) -> str:
+        rows = await jobs.managed_queue(channel.id, "active", limit=None)
+        queued_count = sum(job.status == JobStatus.QUEUED for job in rows)
+        processing_count = len(rows) - queued_count
+        nearest = next_queued_by_schedule(rows)
+        if nearest is None:
+            nearest_text = "—"
+        elif channel.is_paused and not nearest[0].force_publish:
+            nearest_text = f"#{nearest[0].id} · после возобновления"
+        else:
+            nearest_text = f"#{nearest[0].id} · {format_countdown(nearest[1])}"
+        if not channel.is_enabled:
+            channel_status = "⚪ отключён конфигурацией"
+        elif channel.is_paused:
+            channel_status = "⏸ приостановлен"
+        elif channel.active_job_id is not None:
+            channel_status = f"⚙️ обрабатывается задание #{channel.active_job_id}"
+        else:
+            channel_status = "🟢 активен"
+        default = " · основной" if channel.is_default else ""
+        rights = await channel_permission_text(channel, bot)
+        return (
+            f"📡 <b>{escape(channel.title)}</b> · <code>{escape(channel.alias)}</code>{default}\n\n"
+            f"Статус: {channel_status}\n"
+            f"Очередь: {queued_count} ожидают · {processing_count} в работе\n"
+            f"Ближайшая публикация: {nearest_text}\n"
+            f"Режим: <code>{escape(channel.publish_mode)}</code>\n"
+            f"Интервал: {format_duration(channel.publish_interval_seconds)}\n"
+            f"Права бота: {rights}"
+        )
+
+    async def edit_channel_screen(message: Message, channel: Channel, page: int) -> None:
+        text = await channel_details_text(channel, message.bot)
+        try:
+            await message.edit_text(
+                text, parse_mode="HTML", reply_markup=channel_details_keyboard(channel, page),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+
+    async def queue_view_text(
+        rows: list[Job], *, channel: Channel | None, status_filter: str,
+        schedule_rows: list[Job] | None = None,
+    ) -> str:
+        scope_label = escape(channel.alias) if channel is not None else "все каналы"
+        lines = [
+            f"📋 <b>Очередь: {scope_label}</b>",
+            f"Фильтр: {QUEUE_FILTER_LABELS[status_filter]} · найдено {len(rows)}",
+            "",
+        ]
+        estimates = {
+            job.id: estimate
+            for job, estimate in estimate_queue_schedule(schedule_rows or [])
+        }
+        for job in rows[:15]:
+            title = str(job.post_data.get("title") or "Без названия")
+            suffix = ""
+            if job.channel.is_paused and job.status == JobStatus.QUEUED and not job.force_publish:
+                suffix = " · канал на паузе"
+            elif job.id in estimates:
+                suffix = f" · {format_countdown(estimates[job.id])}"
+            elif job.scheduled_at is not None:
+                suffix = (
+                    " · "
+                    + format_schedule_datetime(job.scheduled_at, settings.timezone)
+                )
+            lines.append(
+                f"#{job.id} · {escape(str(job.status))} · {escape(job.channel.alias)}{suffix}\n"
+                f"  {escape(title[:80])}"
+            )
+        if not rows:
+            lines.append("Заданий с таким статусом нет.")
+        elif len(rows) > 15:
+            lines.append(f"\n…показаны первые 15 из {len(rows)} заданий.")
+        return "\n".join(lines)
+
+    async def resolve_queue_scope(scope: int) -> Channel | None:
+        return None if scope == 0 else await jobs.get_channel_by_id(scope)
+
+    async def edit_queue_view(
+        message: Message, *, page: int, scope: int, status_filter: str,
+    ) -> None:
+        channel = await resolve_queue_scope(scope)
+        if scope and channel is None:
+            await message.edit_text("Канал больше не существует.", reply_markup=back_menu_keyboard())
+            return
+        rows = await jobs.managed_queue(scope or None, status_filter, limit=None)
+        schedule_rows = (
+            rows
+            if status_filter == "active"
+            else await jobs.managed_queue(scope or None, "active", limit=None)
+            if status_filter in {"queued", "processing"}
+            else None
+        )
+        text = await queue_view_text(
+            rows,
+            channel=channel,
+            status_filter=status_filter,
+            schedule_rows=schedule_rows,
+        )
+        try:
+            await message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=queue_view_keyboard(
+                    rows, page=page, scope=scope, status_filter=status_filter,
+                ),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+
+    async def queue_job_text(job: Job) -> str:
+        post = deserialize_post(job.post_data)
+        estimate = None
+        if job.status in ACTIVE_JOB_STATUSES:
+            channel_rows = await jobs.managed_queue(job.target_channel_id, "active", limit=None)
+            estimate = next(
+                (value for row, value in estimate_queue_schedule(channel_rows) if row.id == job.id),
+                None,
+            )
+        scheduled = (
+            format_schedule_datetime(job.scheduled_at, settings.timezone)
+            if job.scheduled_at is not None else "—"
+        )
+        lines = [
+            f"📌 <b>Задание #{job.id}</b>",
+            f"Статус: {escape(str(job.status))}",
+            f"Канал: {escape(job.channel.alias)}",
+            f"Название: {escape(post.title)}",
+            f"Позиция: {job.queue_position or '—'}",
+            f"Точное время ({escape(settings.timezone)}): {scheduled}",
+            "Расчётное время: после возобновления"
+            if job.channel.is_paused and job.status == JobStatus.QUEUED and not job.force_publish
+            else f"Расчётное время: {format_countdown(estimate) if estimate else '—'}",
+            f"Попытки: {job.attempts}/{job.max_attempts}",
+        ]
+        if job.error_message:
+            lines.extend(("", f"Ошибка: {escape(job.error_message[:500])}"))
+        return "\n".join(lines)
 
     async def fetch_posts(
         urls: list[str],
@@ -463,8 +786,9 @@ def build_router(
     async def channels(message: Message) -> None:
         rows = await jobs.channels()
         await message.answer("\n".join(
-            f"{item.alias} — {item.title}{' (резервный)' if item.is_default else ''}; "
+            f"{item.alias} — {item.title}{' (основной)' if item.is_default else ''}; "
             f"интервал: {format_duration(item.publish_interval_seconds)}"
+            f"{' · на паузе' if item.is_paused else ''}"
             for item in rows
         ) or "Каналы не настроены.")
 
@@ -472,13 +796,168 @@ def build_router(
     async def channels_button(message: Message) -> None:
         rows = await jobs.channels()
         await message.answer(
-            "📡 Зарегистрированные каналы\n🟢 активен · ⚪ отключён",
+            "📡 Зарегистрированные каналы\n🟢 активен · ⏸ приостановлен · ⚪ отключён",
             reply_markup=channels_menu_keyboard(rows),
         )
 
     @router.callback_query(F.data.startswith(CHANNEL_CALLBACK_PREFIX))
-    async def registered_channel_noop(callback: CallbackQuery) -> None:
+    async def registered_channel_details(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parsed = parse_paginated_selection(callback.data, CHANNEL_CALLBACK_PREFIX)
+        if parsed is None or not parsed[1].isdigit():
+            await callback.answer("Некорректный канал.", show_alert=True)
+            return
+        page, raw_channel_id = parsed
+        channel = await jobs.get_channel_by_id(int(raw_channel_id))
+        if channel is None:
+            await callback.answer("Канал больше не существует.", show_alert=True)
+            return
+        await callback.answer("Проверяю права бота…")
+        await edit_channel_screen(message, channel, page)
+
+    @router.callback_query(F.data.startswith("channel_refresh:"))
+    async def refresh_channel_details(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        channel = await jobs.get_channel_by_id(int(raw_channel_id))
+        if channel is None:
+            await callback.answer("Канал больше не существует.", show_alert=True)
+            return
+        await callback.answer("Обновляю…")
+        await edit_channel_screen(message, channel, int(raw_page))
+
+    @router.callback_query(F.data.startswith("channel_back:"))
+    async def channel_details_back(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = int(callback.data.rsplit(":", 1)[1])
+        channels = await jobs.channels()
         await callback.answer()
+        await message.edit_text(
+            "📡 Зарегистрированные каналы\n🟢 активен · ⏸ приостановлен · ⚪ отключён",
+            reply_markup=channels_menu_keyboard(channels, page),
+        )
+
+    @router.callback_query(F.data.startswith("channel_pause:"))
+    async def toggle_channel_pause(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        channel = await jobs.get_channel_by_id(int(raw_channel_id))
+        if channel is None or not channel.is_enabled:
+            await callback.answer("Отключённым каналом нельзя управлять.", show_alert=True)
+            return
+        updated = await jobs.set_channel_paused(channel.id, not channel.is_paused)
+        if updated is None:
+            await callback.answer("Не удалось изменить состояние канала.", show_alert=True)
+            return
+        if not updated.is_paused:
+            wakeup.set()
+        await callback.answer("Канал приостановлен." if updated.is_paused else "Канал возобновлён.")
+        await edit_channel_screen(message, updated, int(raw_page))
+
+    @router.callback_query(F.data.startswith("channel_default:"))
+    async def make_channel_default(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        channel = await jobs.set_default_channel(int(raw_channel_id))
+        if channel is None:
+            await callback.answer("Канал недоступен.", show_alert=True)
+            return
+        await callback.answer(f"Основной канал: {channel.alias}")
+        await edit_channel_screen(message, channel, int(raw_page))
+
+    @router.callback_query(F.data.startswith("channel_publish:"))
+    async def publish_next_for_channel(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        channel_id = int(raw_channel_id)
+        job = await jobs.force_next_publish(channel_id)
+        if job is None:
+            await callback.answer("В канале нет ожидающих заданий.", show_alert=True)
+            return
+        wakeup.set()
+        channel = await jobs.get_channel_by_id(channel_id)
+        await callback.answer(f"Задание #{job.id} отправится следующим.")
+        if channel is not None:
+            await edit_channel_screen(message, channel, int(raw_page))
+
+    @router.callback_query(F.data.startswith("channel_interval_edit:"))
+    async def edit_channel_interval(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        channel = await jobs.get_channel_by_id(int(raw_channel_id))
+        if channel is None or not channel.is_enabled:
+            await callback.answer("Канал недоступен.", show_alert=True)
+            return
+        await state.set_state(ManageChannel.waiting_for_interval)
+        await state.set_data({
+            "channel_id": channel.id,
+            "channel_page": int(raw_page),
+        })
+        await message.edit_text(
+            f"Текущий интервал {escape(channel.alias)}: "
+            f"{format_duration(channel.publish_interval_seconds)}.\n\n"
+            "Отправьте новый интервал: 30s, 15m, 2h, 1d или 0.",
+            reply_markup=channel_interval_input_keyboard(channel.id, int(raw_page)),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("channel_interval_cancel:"))
+    async def cancel_channel_interval(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_channel_id = callback.data.split(":", 2)
+        await state.clear()
+        channel = await jobs.get_channel_by_id(int(raw_channel_id))
+        if channel is None:
+            await callback.answer("Канал больше не существует.", show_alert=True)
+            return
+        await callback.answer()
+        await edit_channel_screen(message, channel, int(raw_page))
+
+    @router.message(ManageChannel.waiting_for_interval)
+    async def receive_channel_interval(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        channel_id = data.get("channel_id")
+        if not isinstance(channel_id, int):
+            await state.clear()
+            await message.answer("Экран управления каналом устарел.")
+            return
+        try:
+            seconds = parse_duration((message.text or "").strip())
+        except ValueError as error:
+            await message.answer(
+                str(error),
+                reply_markup=channel_interval_input_keyboard(
+                    channel_id, int(data.get("channel_page", 0)),
+                ),
+            )
+            return
+        channel = await jobs.set_channel_interval_by_id(channel_id, seconds)
+        await state.clear()
+        if channel is None:
+            await message.answer("Канал больше недоступен.")
+            return
+        wakeup.set()
+        await message.answer(
+            f"Интервал {escape(channel.alias)} изменён: {format_duration(seconds)}.",
+            parse_mode="HTML",
+            reply_markup=channel_details_keyboard(channel, int(data.get("channel_page", 0))),
+        )
 
     @router.callback_query(F.data.startswith(CHANNEL_PAGE_CALLBACK_PREFIX))
     async def channels_menu_page(callback: CallbackQuery) -> None:
@@ -534,14 +1013,29 @@ def build_router(
             )
         now = datetime.now(UTC)
         schedule = estimate_queue_schedule(rows, now)
-        lines = [
-            f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {format_countdown(estimate, now)}"
-            f"{' · вручную' if job.force_publish else ''}"
-            for job, estimate in schedule[:50]
-        ]
+        lines = []
+        for job, estimate in schedule[:50]:
+            timing = (
+                "после возобновления"
+                if job.channel.is_paused and not job.force_publish
+                else format_countdown(estimate, now)
+            )
+            exact = (
+                f" · точно {format_schedule_datetime(job.scheduled_at, settings.timezone)}"
+                if job.scheduled_at is not None else ""
+            )
+            lines.append(
+                f"#{job.id} · {job.status} · {escape(job.channel.alias)} · {timing}"
+                f"{' · вручную' if job.force_publish else ''}{exact}"
+            )
         if alias:
             completion = max(estimate for _, estimate in schedule)
-            lines.insert(0, queue_summary_line(len(rows), completion, now))
+            lines.insert(
+                0,
+                f"Всего постов: {len(rows)} · канал на паузе"
+                if rows[0].channel.is_paused
+                else queue_summary_line(len(rows), completion, now),
+            )
         if len(schedule) > 50:
             lines.append(f"…показаны ближайшие 50 из {len(schedule)} заданий.")
         return "\n".join(lines)
@@ -586,7 +1080,7 @@ def build_router(
             return
         page, selection = parsed
         channels = await jobs.channels()
-        alias = None
+        scope = 0
         if selection != "all":
             if not selection.isdigit():
                 await callback.answer("Некорректный пункт меню.", show_alert=True)
@@ -598,14 +1092,367 @@ def build_router(
             if channel is None:
                 await callback.answer("Канал удалён или отключён.", show_alert=True)
                 return
-            alias = channel.alias
+            scope = channel.id
         await callback.answer()
-        text = await queue_text(alias)
+        await edit_queue_view(
+            message, page=page, scope=scope, status_filter="active",
+        )
+
+    @router.callback_query(F.data.startswith("queue_back:"))
+    async def queue_view_back(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        page = int(callback.data.rsplit(":", 1)[1])
+        channels = await jobs.channels()
+        await callback.answer()
+        await message.edit_text(
+            "📋 Выберите общую очередь или активный канал:",
+            reply_markup=queue_menu_keyboard(channels, page),
+        )
+
+    @router.callback_query(F.data.startswith("queue_filter:"))
+    async def queue_filter_selection(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 3)
+        if (
+            len(parts) != 4 or not parts[1].isdigit() or not parts[2].isdigit()
+            or parts[3] not in QUEUE_FILTER_STATUSES
+        ):
+            await callback.answer("Некорректный фильтр.", show_alert=True)
+            return
+        await callback.answer()
+        await edit_queue_view(
+            message,
+            page=int(parts[1]),
+            scope=int(parts[2]),
+            status_filter=parts[3],
+        )
+
+    @router.callback_query(F.data.startswith("queue_job:"))
+    async def queue_job_details(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 4)
+        if (
+            len(parts) != 5 or not all(value.isdigit() for value in (parts[1], parts[2], parts[4]))
+            or parts[3] not in QUEUE_FILTER_STATUSES
+        ):
+            await callback.answer("Некорректное задание.", show_alert=True)
+            return
+        page, scope, status_filter, job_id = (
+            int(parts[1]), int(parts[2]), parts[3], int(parts[4])
+        )
+        job = await jobs.get(job_id)
+        if (
+            job is None or job.status not in QUEUE_FILTER_STATUSES[status_filter]
+            or (scope and job.target_channel_id != scope)
+        ):
+            await callback.answer("Задание больше не входит в этот список.", show_alert=True)
+            return
+        await callback.answer()
+        await message.edit_text(
+            await queue_job_text(job),
+            parse_mode="HTML",
+            reply_markup=queue_job_keyboard(
+                job, page=page, scope=scope, status_filter=status_filter,
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("queue_move:"))
+    async def move_queue_job(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 6)
+        if len(parts) != 6:
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id, direction = parts
+        if (
+            not all(value.isdigit() for value in (raw_page, raw_scope, raw_job_id))
+            or status_filter not in QUEUE_FILTER_STATUSES or direction not in {"up", "down"}
+        ):
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        job = await jobs.move_queued(int(raw_job_id), direction)
+        if job is None:
+            await callback.answer("Задание уже нельзя переместить.", show_alert=True)
+            return
+        refreshed = await jobs.get(job.id)
+        await callback.answer("Порядок очереди обновлён.")
+        if refreshed is not None:
+            await message.edit_text(
+                await queue_job_text(refreshed),
+                parse_mode="HTML",
+                reply_markup=queue_job_keyboard(
+                    refreshed,
+                    page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+                ),
+            )
+
+    @router.callback_query(F.data.startswith("queue_schedule:"))
+    async def schedule_queue_job(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 4)
+        if len(parts) != 5:
+            await callback.answer("Некорректное задание.", show_alert=True)
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = parts
+        if (
+            not all(value.isdigit() for value in (raw_page, raw_scope, raw_job_id))
+            or status_filter not in QUEUE_FILTER_STATUSES
+        ):
+            await callback.answer("Некорректное задание.", show_alert=True)
+            return
+        job = await jobs.get(int(raw_job_id))
+        if job is None or job.status != JobStatus.QUEUED:
+            await callback.answer("Задание уже нельзя запланировать.", show_alert=True)
+            return
+        await state.set_state(ManageQueue.waiting_for_schedule)
+        await state.set_data({
+            "job_id": job.id,
+            "queue_page": int(raw_page),
+            "queue_scope": int(raw_scope),
+            "queue_filter": status_filter,
+        })
+        await message.edit_text(
+            f"Введите точное время публикации в часовом поясе {escape(settings.timezone)}.\n"
+            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например 29.07.2026 18:30.",
+            parse_mode="HTML",
+            reply_markup=schedule_input_keyboard(
+                job.id,
+                page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+            ),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("queue_schedule_cancel:"))
+    async def cancel_queue_schedule(callback: CallbackQuery, state: FSMContext) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 4)
+        if len(parts) != 5:
+            await callback.answer("Некорректное задание.", show_alert=True)
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = parts
+        await state.clear()
+        job = await jobs.get(int(raw_job_id))
+        if job is None:
+            await callback.answer("Задание больше не существует.", show_alert=True)
+            return
+        await callback.answer()
+        await message.edit_text(
+            await queue_job_text(job),
+            parse_mode="HTML",
+            reply_markup=queue_job_keyboard(
+                job,
+                page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("queue_schedule_clear:"))
+    async def clear_queue_schedule(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = callback.data.split(":", 4)
+        job = await jobs.set_schedule(int(raw_job_id), None)
+        if job is None:
+            await callback.answer("Точное время уже нельзя изменить.", show_alert=True)
+            return
+        refreshed = await jobs.get(job.id)
+        await callback.answer("Точное время сброшено.")
+        if refreshed is not None:
+            await message.edit_text(
+                await queue_job_text(refreshed),
+                parse_mode="HTML",
+                reply_markup=queue_job_keyboard(
+                    refreshed,
+                    page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+                ),
+            )
+
+    @router.callback_query(F.data.startswith("queue_force:"))
+    async def force_queue_job(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = callback.data.split(":", 4)
+        job = await jobs.force_publish(int(raw_job_id))
+        if job is None:
+            await callback.answer("Задание уже нельзя опубликовать вручную.", show_alert=True)
+            return
+        wakeup.set()
+        refreshed = await jobs.get(job.id)
+        await callback.answer("Задание отправится следующим.")
+        if refreshed is not None:
+            await message.edit_text(
+                await queue_job_text(refreshed),
+                parse_mode="HTML",
+                reply_markup=queue_job_keyboard(
+                    refreshed,
+                    page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+                ),
+            )
+
+    @router.callback_query(F.data.startswith("queue_job_preview:"))
+    async def preview_queue_job(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        job = await jobs.get(job_id)
+        if job is None or job.status != JobStatus.QUEUED:
+            await callback.answer("Предпросмотр уже недоступен.", show_alert=True)
+            return
+        await callback.answer("Готовлю медиа…")
         try:
-            await message.edit_text(text, reply_markup=queue_menu_keyboard(channels, page))
-        except TelegramBadRequest as error:
-            if "message is not modified" not in str(error).lower():
-                raise
+            await previews.send(job, message.chat.id)
+        except ApplicationError as error:
+            await message.answer(f"Не удалось показать медиа: {error}")
+
+    @router.callback_query(F.data.startswith("queue_cancel_job:"))
+    async def cancel_queue_job(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = callback.data.split(":", 4)
+        if not await jobs.request_cancel(int(raw_job_id)):
+            await callback.answer("Задание уже нельзя отменить.", show_alert=True)
+            return
+        wakeup.set()
+        await callback.answer("Задание отменено.")
+        await edit_queue_view(
+            message,
+            page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+        )
+
+    @router.callback_query(F.data.startswith("queue_retry:"))
+    async def retry_queue_job(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        _, raw_page, raw_scope, status_filter, raw_job_id = callback.data.split(":", 4)
+        if not await jobs.enqueue(int(raw_job_id)):
+            await callback.answer("Задание уже нельзя повторить.", show_alert=True)
+            return
+        wakeup.set()
+        await callback.answer("Задание возвращено в очередь.")
+        await edit_queue_view(
+            message,
+            page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+        )
+
+    @router.callback_query(F.data.startswith("queue_bulk_prompt:"))
+    async def prompt_queue_bulk_action(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 5)
+        if len(parts) != 5:
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        _, action, raw_page, raw_scope, status_filter = parts
+        if action not in {"cancel", "retry"} or status_filter not in QUEUE_FILTER_STATUSES:
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        action_text = (
+            "Отменить все задания, попавшие под текущий фильтр?"
+            if action == "cancel"
+            else "Повторить все неудачные задания в выбранной области?"
+        )
+        await callback.answer()
+        await message.edit_text(
+            f"⚠️ {action_text}",
+            reply_markup=bulk_confirmation_keyboard(
+                action,
+                page=int(raw_page), scope=int(raw_scope), status_filter=status_filter,
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("queue_bulk_confirm:"))
+    async def confirm_queue_bulk_action(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 5)
+        if len(parts) != 5:
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        _, action, raw_page, raw_scope, status_filter = parts
+        scope = int(raw_scope)
+        if action == "cancel":
+            count = await jobs.cancel_filtered(scope or None, status_filter)
+            result_text = f"Отменено или отмечено для отмены: {count}."
+        elif action == "retry":
+            result = await jobs.retry_failed(scope or None)
+            result_text = f"Возвращено в очередь: {result.retried}."
+            if result.skipped_uncertain:
+                result_text += (
+                    f" Пропущено uncertain_publish: {result.skipped_uncertain} — "
+                    "их нужно проверить вручную."
+                )
+        else:
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        wakeup.set()
+        await callback.answer(result_text, show_alert=True)
+        await edit_queue_view(
+            message,
+            page=int(raw_page), scope=scope, status_filter=status_filter,
+        )
+
+    @router.message(ManageQueue.waiting_for_schedule)
+    async def receive_queue_schedule(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        job_id = data.get("job_id")
+        if not isinstance(job_id, int):
+            await state.clear()
+            await message.answer("Экран планирования устарел.")
+            return
+        try:
+            scheduled_at = parse_schedule_datetime(
+                message.text or "", settings.timezone,
+            )
+        except ValueError as error:
+            await message.answer(
+                str(error),
+                reply_markup=schedule_input_keyboard(
+                    job_id,
+                    page=int(data.get("queue_page", 0)),
+                    scope=int(data.get("queue_scope", 0)),
+                    status_filter=str(data.get("queue_filter", "active")),
+                ),
+            )
+            return
+        job = await jobs.set_schedule(job_id, scheduled_at)
+        await state.clear()
+        if job is None:
+            await message.answer("Задание уже нельзя запланировать.")
+            return
+        wakeup.set()
+        refreshed = await jobs.get(job.id)
+        if refreshed is None:
+            await message.answer("Задание больше не существует.")
+            return
+        status_filter = str(data.get("queue_filter", "active"))
+        await message.answer(
+            await queue_job_text(refreshed),
+            parse_mode="HTML",
+            reply_markup=queue_job_keyboard(
+                refreshed,
+                page=int(data.get("queue_page", 0)),
+                scope=int(data.get("queue_scope", 0)),
+                status_filter=status_filter,
+            ),
+        )
 
     @router.message(Command("publish"))
     async def publish_job(message: Message, command: CommandObject) -> None:
@@ -788,6 +1635,59 @@ def build_router(
             reply_markup=caption_input_keyboard(job_id),
         )
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("title:") | F.data.startswith("description:"))
+    async def edit_post_field(callback: CallbackQuery, state: FSMContext) -> None:
+        field, raw_job_id = callback.data.split(":", 1)
+        job_id = int(raw_job_id)
+        job = await jobs.get(job_id)
+        if not job or job.status != JobStatus.WAITING_CONFIRMATION:
+            await callback.answer("Метаданные этого задания уже нельзя изменить.", show_alert=True)
+            return
+        post = deserialize_post(job.post_data)
+        current = post.title if field == "title" else post.description
+        state_value = (
+            EditPreview.waiting_for_title
+            if field == "title" else EditPreview.waiting_for_description
+        )
+        await state.set_state(state_value)
+        await state.set_data({"job_id": job_id, "post_field": field})
+        field_label = "заголовок" if field == "title" else "описание"
+        clear_hint = " Отправьте <code>-</code>, чтобы удалить описание." if field == "description" else ""
+        await callback.message.answer(
+            f"<b>Текущий {field_label}</b>\n{escape(current) or '—'}\n\n"
+            f"Отправьте новый {field_label} обычным текстом.{clear_hint}",
+            parse_mode="HTML",
+            reply_markup=post_field_input_keyboard(job_id, field),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("post_field_cancel:"))
+    async def cancel_post_field_input(callback: CallbackQuery, state: FSMContext) -> None:
+        _, field, raw_job_id = callback.data.split(":", 2)
+        job_id = int(raw_job_id)
+        data = await state.get_data()
+        if data.get("job_id") != job_id or data.get("post_field") != field:
+            await callback.answer("Редактирование уже завершено.", show_alert=True)
+            return
+        await state.clear()
+        await callback.message.edit_text(
+            "Изменение отменено.", reply_markup=preview_keyboard(job_id),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("media:"))
+    async def show_initial_preview_media(callback: CallbackQuery) -> None:
+        job_id = int(callback.data.split(":", 1)[1])
+        job = await jobs.get(job_id)
+        if not job or job.status != JobStatus.WAITING_CONFIRMATION:
+            await callback.answer("Предпросмотр уже недоступен.", show_alert=True)
+            return
+        await callback.answer("Готовлю облегчённое медиа…")
+        try:
+            await previews.send(job, callback.message.chat.id)
+        except ApplicationError as error:
+            await callback.message.answer(f"Не удалось показать медиа: {error}")
 
     @router.callback_query(F.data.startswith("caption_auto:"))
     async def restore_automatic_caption(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1105,6 +2005,46 @@ def build_router(
         await state.clear()
         await message.answer("Подпись обновлена. Проверьте итоговый вариант:")
         await send_confirmation(message, job, queued=queued)
+
+    async def receive_post_field_value(message: Message, state: FSMContext, field: str) -> None:
+        data = await state.get_data()
+        job_id = data.get("job_id")
+        if not isinstance(job_id, int) or data.get("post_field") != field:
+            await state.clear()
+            await message.answer("Редактирование устарело. Откройте предпросмотр заново.")
+            return
+        value = (message.text or "").strip()
+        if field == "description" and value == "-":
+            value = ""
+        if field == "title" and not value:
+            await message.answer(
+                "Заголовок не может быть пустым.",
+                reply_markup=post_field_input_keyboard(job_id, field),
+            )
+            return
+        limit = 300 if field == "title" else 4000
+        if len(value) > limit:
+            await message.answer(
+                f"Слишком длинный текст: {len(value)} из {limit} символов.",
+                reply_markup=post_field_input_keyboard(job_id, field),
+            )
+            return
+        job = await jobs.set_post_field(job_id, field, value)
+        if job is None:
+            await state.clear()
+            await message.answer("Метаданные этого задания уже нельзя изменить.")
+            return
+        await state.clear()
+        await message.answer("Данные обновлены. Проверьте итоговый вариант:")
+        await send_confirmation(message, job)
+
+    @router.message(EditPreview.waiting_for_title)
+    async def receive_title(message: Message, state: FSMContext) -> None:
+        await receive_post_field_value(message, state, "title")
+
+    @router.message(EditPreview.waiting_for_description)
+    async def receive_description(message: Message, state: FSMContext) -> None:
+        await receive_post_field_value(message, state, "description")
 
     @router.message(F.text)
     async def submission(message: Message, state: FSMContext) -> None:

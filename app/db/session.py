@@ -38,9 +38,18 @@ def _upgrade_schema(connection) -> None:
         connection.execute(text("ALTER TABLE channels ADD COLUMN next_publish_at TIMESTAMP NULL"))
     if "active_job_id" not in columns:
         connection.execute(text("ALTER TABLE channels ADD COLUMN active_job_id INTEGER NULL"))
+    if "is_paused" not in columns:
+        connection.execute(text("ALTER TABLE channels ADD COLUMN is_paused BOOLEAN NOT NULL DEFAULT FALSE"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_channels_active_job_id ON channels (active_job_id)"))
     job_columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
     if "force_publish" not in job_columns:
         connection.execute(text("ALTER TABLE jobs ADD COLUMN force_publish BOOLEAN NOT NULL DEFAULT FALSE"))
     if "caption_override" not in job_columns:
         connection.execute(text("ALTER TABLE jobs ADD COLUMN caption_override TEXT NULL"))
+    if "queue_position" not in job_columns:
+        connection.execute(text("ALTER TABLE jobs ADD COLUMN queue_position INTEGER NULL"))
+        connection.execute(text("UPDATE jobs SET queue_position = id WHERE queue_position IS NULL"))
+    if "scheduled_at" not in job_columns:
+        connection.execute(text("ALTER TABLE jobs ADD COLUMN scheduled_at TIMESTAMP NULL"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_queue_position ON jobs (queue_position)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_scheduled_at ON jobs (scheduled_at)"))

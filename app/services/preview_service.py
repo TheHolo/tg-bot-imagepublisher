@@ -1,4 +1,5 @@
 import shutil
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -47,7 +48,13 @@ class PreviewService:
         await self.translator.enrich_title(post)
         temporary_id = f"preview-{job.id}-{uuid4().hex}"
         try:
-            downloaded = [await self.downloader.download(temporary_id, item) for item in post.media_items]
+            downloaded = [
+                await self.downloader.download(
+                    temporary_id,
+                    replace(item, url=item.preview_url) if item.preview_url else item,
+                )
+                for item in post.media_items
+            ]
             prepared = [await self.media.prepare(item, job.channel.publish_mode) for item in downloaded]
             caption = self._build_caption(job, post)
             await self.publisher.preview(chat_id, prepared, caption)

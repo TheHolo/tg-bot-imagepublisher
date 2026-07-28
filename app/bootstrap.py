@@ -13,8 +13,8 @@ from app.bot.router import build_router
 from app.config import Settings
 from app.db.models import Channel
 from app.db.session import create_database, create_schema
-from app.providers.direct_image import DirectImageProvider
 from app.providers.deviantart import DeviantArtProvider
+from app.providers.direct_image import DirectImageProvider
 from app.providers.pixiv import PixivProvider
 from app.providers.registry import ProviderRegistry
 from app.queue.worker import WorkerPool
@@ -24,8 +24,8 @@ from app.services.health_service import HealthService
 from app.services.ingest_service import IngestService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
-from app.services.publisher_service import TelegramPublisher
 from app.services.preview_service import PreviewService
+from app.services.publisher_service import TelegramPublisher
 from app.services.translation_service import TranslationService
 
 
@@ -122,14 +122,27 @@ async def _sync_channels(sessions, settings: Settings) -> None:
     async with sessions() as session, session.begin():
         for alias, values in settings.channels_json.items():
             channel = await session.scalar(select(Channel).where(Channel.alias == alias))
+            is_new = channel is None
             if channel is None:
-                channel = Channel(alias=alias, telegram_chat_id=str(values["chat_id"]), title=values.get("title", alias))
+                channel = Channel(
+                    alias=alias,
+                    telegram_chat_id=str(values["chat_id"]),
+                    title=values.get("title", alias),
+                    is_default=alias == settings.default_channel_alias,
+                )
                 session.add(channel)
             channel.telegram_chat_id = str(values["chat_id"])
             channel.title = values.get("title", alias)
             channel.publish_mode = values.get("publish_mode", "auto")
-            if "publish_interval_seconds" in values:
+            if is_new and "publish_interval_seconds" in values:
                 channel.publish_interval_seconds = int(values["publish_interval_seconds"])
             channel.caption_template = values.get("caption_template")
             channel.is_enabled = values.get("enabled", True)
-            channel.is_default = alias == settings.default_channel_alias
+        await session.flush()
+        default_channel = await session.scalar(select(Channel).where(Channel.is_default.is_(True)))
+        if default_channel is None:
+            configured_default = await session.scalar(
+                select(Channel).where(Channel.alias == settings.default_channel_alias)
+            )
+            if configured_default is not None:
+                configured_default.is_default = True

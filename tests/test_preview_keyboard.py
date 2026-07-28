@@ -3,13 +3,18 @@ from datetime import UTC, datetime, timedelta
 from app.bot.router import (
     cancel_tag_input_keyboard,
     caption_input_keyboard,
+    channel_details_keyboard,
     channel_selection_keyboard,
+    preview_keyboard,
+    queue_job_keyboard,
     queue_summary_line,
+    queue_view_keyboard,
     queued_preview_keyboard,
     replace_channel_line,
     wizard_channel_keyboard,
 )
-from app.db.models import Channel
+from app.db.models import Channel, Job
+from app.domain.enums import JobStatus
 
 
 def test_queued_preview_keyboard_has_expected_layout():
@@ -51,6 +56,75 @@ def test_caption_input_keyboard_can_restore_automatic_caption_or_cancel():
         "caption_auto:42",
         "caption_input_cancel:42",
     ]
+
+
+def test_initial_preview_keyboard_exposes_all_editing_steps_and_media():
+    buttons = [
+        button
+        for row in preview_keyboard(42).inline_keyboard
+        for button in row
+    ]
+
+    assert {button.callback_data for button in buttons} >= {
+        "title:42",
+        "description:42",
+        "caption:42",
+        "media:42",
+    }
+
+
+def test_channel_details_keyboard_has_runtime_management_actions():
+    channel = Channel(
+        id=7, alias="artwork", telegram_chat_id="-1001", title="Artwork",
+        is_paused=False,
+    )
+    callbacks = [
+        button.callback_data
+        for row in channel_details_keyboard(channel, page=1).inline_keyboard
+        for button in row
+    ]
+
+    assert callbacks[:4] == [
+        "channel_pause:1:7",
+        "channel_interval_edit:1:7",
+        "channel_default:1:7",
+        "channel_publish:1:7",
+    ]
+
+
+def test_queued_job_keyboard_has_reordering_schedule_and_manual_publish():
+    job = Job(id=42, status=JobStatus.QUEUED, scheduled_at=None)
+    callbacks = [
+        button.callback_data
+        for row in queue_job_keyboard(
+            job, page=0, scope=7, status_filter="active",
+        ).inline_keyboard
+        for button in row
+    ]
+
+    assert "queue_move:0:7:active:42:up" in callbacks
+    assert "queue_move:0:7:active:42:down" in callbacks
+    assert "queue_schedule:0:7:active:42" in callbacks
+    assert "queue_force:0:7:active:42" in callbacks
+
+
+def test_queue_view_keyboard_exposes_all_status_filters():
+    callbacks = [
+        button.callback_data
+        for row in queue_view_keyboard(
+            [], page=0, scope=7, status_filter="active",
+        ).inline_keyboard
+        for button in row
+    ]
+
+    assert {callback.rsplit(":", 1)[-1] for callback in callbacks if callback.startswith("queue_filter:")} >= {
+        "active",
+        "queued",
+        "processing",
+        "failed",
+        "completed",
+        "cancelled",
+    }
 
 
 def test_channel_selection_keyboard_lists_channels_and_marks_current():

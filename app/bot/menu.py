@@ -164,7 +164,11 @@ def channels_menu_keyboard(channels: Sequence[Channel], page: int = 0) -> Inline
     visible, page, page_count = paginate_channels(channels, page)
     rows = [[
         InlineKeyboardButton(
-            text=_channel_button_text(channel, "🟢" if channel.is_enabled else "⚪"),
+            text=_channel_button_text(
+                channel,
+                "⏸" if channel.is_enabled and channel.is_paused
+                else "🟢" if channel.is_enabled else "⚪",
+            ),
             callback_data=f"{CHANNEL_CALLBACK_PREFIX}{page}:{channel.id}",
         )
     ] for channel in visible]

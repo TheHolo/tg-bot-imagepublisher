@@ -1,4 +1,5 @@
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -8,6 +9,21 @@ from sqlalchemy.sql import ColumnElement
 from app.db.models import Channel, Job, JobEvent, Publication, User, utcnow
 from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
 from app.domain.models import SourcePost
+
+QUEUE_FILTER_STATUSES = {
+    "active": ACTIVE_JOB_STATUSES,
+    "queued": {JobStatus.QUEUED},
+    "processing": {JobStatus.DOWNLOADING, JobStatus.PROCESSING, JobStatus.PUBLISHING},
+    "failed": {JobStatus.FAILED},
+    "completed": {JobStatus.COMPLETED},
+    "cancelled": {JobStatus.CANCELLED},
+}
+
+
+@dataclass(frozen=True)
+class BulkRetryResult:
+    retried: int
+    skipped_uncertain: int
 
 
 def serialize_post(post: SourcePost) -> dict:
@@ -80,6 +96,14 @@ class JobService:
                 )
                 if channel:
                     return channel
+            database_default = await session.scalar(
+                select(Channel).where(
+                    Channel.is_default.is_(True),
+                    Channel.is_enabled.is_(True),
+                )
+            )
+            if database_default is not None:
+                return database_default
             return await session.scalar(
                 select(Channel).where(
                     Channel.alias == default_alias,
@@ -91,16 +115,41 @@ class JobService:
         async with self.sessions() as session:
             return list((await session.scalars(select(Channel).order_by(Channel.alias))).all())
 
+    async def get_channel_by_id(self, channel_id: int) -> Channel | None:
+        async with self.sessions() as session:
+            return await session.get(Channel, channel_id)
+
     async def set_channel_interval(self, alias: str, seconds: int) -> Channel | None:
         async with self.sessions() as session, session.begin():
             channel = await session.scalar(select(Channel).where(Channel.alias == alias, Channel.is_enabled.is_(True)))
             if not channel:
                 return None
-            channel.publish_interval_seconds = seconds
-            last_published = await session.scalar(
-                select(func.max(Publication.published_at)).where(Publication.channel_id == channel.id)
-            )
-            channel.next_publish_at = last_published + timedelta(seconds=seconds) if last_published and seconds else None
+            await self._set_channel_interval(session, channel, seconds)
+            return channel
+
+    async def set_channel_interval_by_id(self, channel_id: int, seconds: int) -> Channel | None:
+        async with self.sessions() as session, session.begin():
+            channel = await session.get(Channel, channel_id)
+            if channel is None or not channel.is_enabled:
+                return None
+            await self._set_channel_interval(session, channel, seconds)
+            return channel
+
+    async def set_channel_paused(self, channel_id: int, paused: bool) -> Channel | None:
+        async with self.sessions() as session, session.begin():
+            channel = await session.get(Channel, channel_id)
+            if channel is None or not channel.is_enabled:
+                return None
+            channel.is_paused = paused
+            return channel
+
+    async def set_default_channel(self, channel_id: int) -> Channel | None:
+        async with self.sessions() as session, session.begin():
+            channel = await session.get(Channel, channel_id)
+            if channel is None or not channel.is_enabled:
+                return None
+            await session.execute(update(Channel).values(is_default=False))
+            channel.is_default = True
             return channel
 
     async def create_preview(
@@ -137,6 +186,22 @@ class JobService:
             job.caption_override = caption
             return job
 
+    async def set_post_field(self, job_id: int, field: str, value: str) -> Job | None:
+        if field not in {"title", "description"}:
+            raise ValueError(f"Unsupported post field: {field}")
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not job or job.status != JobStatus.WAITING_CONFIRMATION:
+                return None
+            post_data = dict(job.post_data)
+            post_data[field] = value
+            if field == "title":
+                metadata = dict(post_data.get("metadata", {}))
+                metadata.pop("title_translation", None)
+                post_data["metadata"] = metadata
+            job.post_data = post_data
+            return job
+
     async def get(self, job_id: int) -> Job | None:
         async with self.sessions() as session:
             return await session.scalar(
@@ -165,9 +230,13 @@ class JobService:
                 return False
             if job.status == JobStatus.FAILED:
                 job.attempts = 0
+                job.scheduled_at = None
+                job.force_publish = False
             job.status = JobStatus.QUEUED
             job.cancel_requested = False
             job.error_code = job.error_message = None
+            job.finished_at = None
+            job.queue_position = await self._next_queue_position(session, job.target_channel_id)
             return True
 
     async def claim_next(self) -> Job | None:
@@ -182,13 +251,27 @@ class JobService:
                         or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= utcnow()),
                         Channel.is_enabled.is_(True),
                         Channel.active_job_id.is_(None),
+                        or_(Channel.is_paused.is_(False), Job.force_publish.is_(True)),
+                        or_(
+                            Job.force_publish.is_(True),
+                            Job.scheduled_at.is_(None),
+                            Job.scheduled_at <= utcnow(),
+                        ),
                         or_(
                             Job.force_publish.is_(True),
                             Channel.next_publish_at.is_(None),
                             Channel.next_publish_at <= utcnow(),
                         ),
                     )
-                    .order_by(Job.force_publish.desc(), Job.created_at, Job.id)
+                    .order_by(
+                        Job.force_publish.desc(),
+                        Job.scheduled_at.is_(None),
+                        Job.scheduled_at,
+                        Job.queue_position.is_(None),
+                        Job.queue_position,
+                        Job.created_at,
+                        Job.id,
+                    )
                     .limit(1)
                 )
                 row = candidate.first()
@@ -229,13 +312,14 @@ class JobService:
             if not job or job.status != JobStatus.QUEUED or job.cancel_requested:
                 return None
             job.force_publish = True
+            job.scheduled_at = None
             session.add(JobEvent(
                 job_id=job.id, event_type="manual_publish", old_status=job.status,
                 new_status=job.status, message="Manual publication requested",
             ))
             return job
 
-    async def force_next_publish(self) -> Job | None:
+    async def force_next_publish(self, channel_id: int | None = None) -> Job | None:
         async with self.sessions() as session, session.begin():
             candidate = (
                 select(Job.id)
@@ -245,13 +329,17 @@ class JobService:
                     Job.cancel_requested.is_(False),
                     Channel.is_enabled.is_(True),
                 )
-                .order_by(Job.created_at, Job.id)
+                .order_by(
+                    Job.queue_position.is_(None), Job.queue_position, Job.created_at, Job.id,
+                )
                 .limit(1)
             )
+            if channel_id is not None:
+                candidate = candidate.where(Job.target_channel_id == channel_id)
             forced_id = await session.scalar(
                 update(Job)
                 .where(Job.id == candidate.scalar_subquery(), Job.status == JobStatus.QUEUED)
-                .values(force_publish=True)
+                .values(force_publish=True, scheduled_at=None)
                 .returning(Job.id)
             )
             if forced_id is None:
@@ -311,6 +399,45 @@ class JobService:
                 user.last_selected_channel_id = channel.id
             return channel
 
+    async def set_schedule(self, job_id: int, scheduled_at: datetime | None) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not job or job.status != JobStatus.QUEUED:
+                return None
+            job.scheduled_at = scheduled_at
+            if scheduled_at is not None:
+                job.force_publish = False
+            return job
+
+    async def move_queued(self, job_id: int, direction: str) -> Job | None:
+        if direction not in {"up", "down"}:
+            raise ValueError(f"Unsupported direction: {direction}")
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not job or job.status != JobStatus.QUEUED:
+                return None
+            rows = list((await session.scalars(
+                select(Job)
+                .where(
+                    Job.target_channel_id == job.target_channel_id,
+                    Job.status == JobStatus.QUEUED,
+                )
+                .order_by(
+                    Job.queue_position.is_(None), Job.queue_position, Job.created_at, Job.id,
+                )
+            )).all())
+            for position, row in enumerate(rows, start=1):
+                row.queue_position = position
+            index = next((index for index, row in enumerate(rows) if row.id == job_id), None)
+            if index is None:
+                return None
+            neighbor_index = index - 1 if direction == "up" else index + 1
+            if neighbor_index < 0 or neighbor_index >= len(rows):
+                return job
+            neighbor = rows[neighbor_index]
+            job.queue_position, neighbor.queue_position = neighbor.queue_position, job.queue_position
+            return job
+
     async def duplicate(self, job: Job) -> Publication | None:
         async with self.sessions() as session:
             return await session.scalar(
@@ -352,6 +479,7 @@ class JobService:
                 return False
             job.allow_duplicate = True
             job.status = JobStatus.QUEUED
+            job.queue_position = await self._next_queue_position(session, job.target_channel_id)
             return True
 
     async def queue(self, alias: str | None = None, limit: int | None = 50) -> list[Job] | None:
@@ -371,12 +499,84 @@ class JobService:
             )
             if channel_id is not None:
                 statement = statement.where(Job.target_channel_id == channel_id)
-            statement = statement.order_by(Channel.alias, Job.created_at, Job.id)
+            statement = statement.order_by(
+                Channel.alias, Job.queue_position.is_(None), Job.queue_position,
+                Job.created_at, Job.id,
+            )
             if limit is not None:
                 statement = statement.limit(limit)
             return list(
                 (await session.scalars(statement)).all()
             )
+
+    async def managed_queue(
+        self, channel_id: int | None, status_filter: str, limit: int | None = 50,
+    ) -> list[Job]:
+        statuses = QUEUE_FILTER_STATUSES.get(status_filter)
+        if statuses is None:
+            raise ValueError(f"Unsupported queue filter: {status_filter}")
+        async with self.sessions() as session:
+            statement = (
+                select(Job)
+                .join(Channel, Job.target_channel_id == Channel.id)
+                .options(selectinload(Job.channel))
+                .where(Job.status.in_(statuses))
+            )
+            if channel_id is not None:
+                statement = statement.where(Job.target_channel_id == channel_id)
+            statement = statement.order_by(
+                Channel.alias, Job.queue_position.is_(None), Job.queue_position,
+                Job.created_at, Job.id,
+            )
+            if limit is not None:
+                statement = statement.limit(limit)
+            return list((await session.scalars(statement)).all())
+
+    async def cancel_filtered(self, channel_id: int | None, status_filter: str) -> int:
+        statuses = QUEUE_FILTER_STATUSES.get(status_filter)
+        if statuses is None:
+            raise ValueError(f"Unsupported queue filter: {status_filter}")
+        if status_filter in {"completed", "cancelled"}:
+            return 0
+        async with self.sessions() as session, session.begin():
+            statement = select(Job).where(Job.status.in_(statuses))
+            if channel_id is not None:
+                statement = statement.where(Job.target_channel_id == channel_id)
+            rows = list((await session.scalars(statement)).all())
+            active = {JobStatus.DOWNLOADING, JobStatus.PROCESSING, JobStatus.PUBLISHING}
+            for job in rows:
+                if job.status in active:
+                    job.cancel_requested = True
+                else:
+                    job.status = JobStatus.CANCELLED
+                    job.finished_at = utcnow()
+            return len(rows)
+
+    async def retry_failed(self, channel_id: int | None) -> BulkRetryResult:
+        async with self.sessions() as session, session.begin():
+            statement = select(Job).where(Job.status == JobStatus.FAILED)
+            if channel_id is not None:
+                statement = statement.where(Job.target_channel_id == channel_id)
+            rows = list((await session.scalars(statement)).all())
+            retried = 0
+            skipped_uncertain = 0
+            for job in rows:
+                if job.error_code == "uncertain_publish":
+                    skipped_uncertain += 1
+                    continue
+                job.status = JobStatus.QUEUED
+                job.attempts = 0
+                job.error_code = job.error_message = None
+                job.cancel_requested = False
+                job.force_publish = False
+                job.finished_at = None
+                job.next_attempt_at = None
+                job.scheduled_at = None
+                job.queue_position = await self._next_queue_position(
+                    session, job.target_channel_id,
+                )
+                retried += 1
+            return BulkRetryResult(retried=retried, skipped_uncertain=skipped_uncertain)
 
     async def recent(self, limit: int = 10) -> list[Job]:
         async with self.sessions() as session:
@@ -451,4 +651,26 @@ class JobService:
             update(Channel)
             .where(Channel.id == job.target_channel_id, Channel.active_job_id == job.id)
             .values(active_job_id=None)
+        )
+
+    @staticmethod
+    async def _next_queue_position(session: AsyncSession, channel_id: int) -> int:
+        current = await session.scalar(
+            select(func.max(Job.queue_position)).where(Job.target_channel_id == channel_id)
+        )
+        return int(current or 0) + 1
+
+    @staticmethod
+    async def _set_channel_interval(
+        session: AsyncSession, channel: Channel, seconds: int,
+    ) -> None:
+        channel.publish_interval_seconds = seconds
+        last_published = await session.scalar(
+            select(func.max(Publication.published_at)).where(
+                Publication.channel_id == channel.id,
+            )
+        )
+        channel.next_publish_at = (
+            last_published + timedelta(seconds=seconds)
+            if last_published and seconds else None
         )

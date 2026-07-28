@@ -12,7 +12,12 @@ async def test_existing_database_gets_additive_columns(tmp_path):
     async with engine.begin() as connection:
         await connection.execute(text("DROP INDEX ix_channels_active_job_id"))
         await connection.execute(text("ALTER TABLE channels DROP COLUMN active_job_id"))
+        await connection.execute(text("ALTER TABLE channels DROP COLUMN is_paused"))
+        await connection.execute(text("DROP INDEX ix_jobs_queue_position"))
+        await connection.execute(text("DROP INDEX ix_jobs_scheduled_at"))
         await connection.execute(text("ALTER TABLE jobs DROP COLUMN caption_override"))
+        await connection.execute(text("ALTER TABLE jobs DROP COLUMN queue_position"))
+        await connection.execute(text("ALTER TABLE jobs DROP COLUMN scheduled_at"))
 
     await create_schema(engine)
 
@@ -28,7 +33,10 @@ async def test_existing_database_gets_additive_columns(tmp_path):
             }
         )
     assert "active_job_id" in channel_columns
+    assert "is_paused" in channel_columns
     assert "caption_override" in job_columns
+    assert "queue_position" in job_columns
+    assert "scheduled_at" in job_columns
     await engine.dispose()
 
 

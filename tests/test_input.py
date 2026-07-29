@@ -1,7 +1,12 @@
 import pytest
 
-from app.domain.exceptions import InvalidUrlError
-from app.utils.input import parse_submission, parse_submission_batch
+from app.domain.exceptions import InvalidMediaSelectionError, InvalidUrlError
+from app.utils.input import (
+    parse_media_selection,
+    parse_submission,
+    parse_submission_batch,
+    split_source_selection,
+)
 from app.utils.urls import extract_urls, validate_public_url
 
 
@@ -45,3 +50,48 @@ def test_private_or_invalid_urls_rejected(url):
 
 def test_url_punctuation_is_trimmed():
     assert extract_urls("see (https://example.com/image.jpg).") == ["https://example.com/image.jpg"]
+    assert parse_submission_batch("see (https://example.com/image.jpg).") == (
+        ["https://example.com/image.jpg"], ["see"], None,
+    )
+
+
+def test_image_selection_is_attached_to_preceding_url_and_not_added_to_tags():
+    urls, tags, channel = parse_submission_batch(
+        "https://www.pixiv.net/en/artworks/140228555 [1, 3, 5-7, 10] art --channel works"
+    )
+
+    assert urls == ["https://www.pixiv.net/en/artworks/140228555 [1,3,5,6,7,10]"]
+    assert tags == ["art"]
+    assert channel == "works"
+    assert split_source_selection(urls[0]) == (
+        "https://www.pixiv.net/en/artworks/140228555",
+        (1, 3, 5, 6, 7, 10),
+    )
+
+
+def test_each_url_can_have_its_own_image_selection():
+    urls, tags, _ = parse_submission_batch(
+        "https://www.pixiv.net/artworks/1 [2] "
+        "https://www.deviantart.com/artist/art/work-2 [3-4] tag"
+    )
+
+    assert urls == [
+        "https://www.pixiv.net/artworks/1 [2]",
+        "https://www.deviantart.com/artist/art/work-2 [3,4]",
+    ]
+    assert tags == ["tag"]
+
+
+def test_media_selection_deduplicates_numbers_and_preserves_requested_order():
+    assert parse_media_selection("5,1-3,2,5") == (5, 1, 2, 3)
+
+
+@pytest.mark.parametrize("selection", ["", "0", "3-1", "one", "1,,2"])
+def test_invalid_media_selection_is_rejected(selection):
+    with pytest.raises(InvalidMediaSelectionError):
+        parse_submission_batch(f"https://www.pixiv.net/artworks/1 [{selection}]")
+
+
+def test_unclosed_media_selection_is_rejected():
+    with pytest.raises(InvalidMediaSelectionError, match="Не закрыта"):
+        parse_submission_batch("https://www.pixiv.net/artworks/1 [1-3")

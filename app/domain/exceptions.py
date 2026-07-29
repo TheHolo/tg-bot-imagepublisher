@@ -45,6 +45,10 @@ class TooManyMediaError(MediaValidationError):
     code = "too_many_media"
 
 
+class InvalidMediaSelectionError(MediaValidationError):
+    code = "invalid_media_selection"
+
+
 class PublishError(ApplicationError):
     code = "publish_error"
 

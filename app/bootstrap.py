@@ -78,16 +78,16 @@ async def bootstrap(settings: Settings | None = None) -> Application:
     bot_session = AiohttpSession(proxy=proxy_url) if proxy_url else None
     bot = Bot(settings.bot_token, session=bot_session)
     registry = ProviderRegistry([
-        PixivProvider(
-            http, settings.pixiv_cookies,
-            media_limit_enabled=settings.pixiv_media_limit_enabled,
-            max_images=settings.pixiv_max_images,
-        ),
+        PixivProvider(http, settings.pixiv_cookies),
         DeviantArtProvider(http),
         DirectImageProvider(http, settings.max_download_bytes),
     ])
     jobs = JobService(sessions)
-    ingest = IngestService(registry, settings.max_tags, settings.max_tag_length, settings.max_urls_per_message)
+    ingest = IngestService(
+        registry, settings.max_tags, settings.max_tag_length, settings.max_urls_per_message,
+        media_limit_enabled=settings.pixiv_media_limit_enabled,
+        max_images=settings.pixiv_max_images,
+    )
     downloader = DownloadService(http, settings.storage_path, settings.max_download_bytes)
     media = MediaService()
     captions = CaptionService()

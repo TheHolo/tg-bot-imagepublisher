@@ -1,8 +1,12 @@
+import html
+import json
 import mimetypes
 import re
 from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
+
+import aiohttp
 
 from app.domain.exceptions import (
     InvalidUrlError,
@@ -21,7 +25,7 @@ class DeviantArtProvider(BaseProvider):
     healthcheck_url = _oembed_url
     healthcheck_statuses = frozenset({200, 400, 404})
     _path_re = re.compile(r"^/([^/]+)/art/([^/?#]+)-(\d+)/?$", re.IGNORECASE)
-    _media_hosts = {"wixmp.com", "deviantart.net", "deviantart.com"}
+    _media_hosts = frozenset({"wixmp.com", "deviantart.net", "deviantart.com"})
 
     def can_handle(self, url: str) -> bool:
         parsed = urlsplit(url)
@@ -58,6 +62,29 @@ class DeviantArtProvider(BaseProvider):
             raise SourceNotFoundError("DeviantArt вернул некорректные данные публикации")
         return payload
 
+    async def _additional_media(self, normalized: str) -> list[dict]:
+        """Read Eclipse's public album metadata embedded in a deviation page."""
+        try:
+            async with self.session.get(
+                normalized,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.deviantart.com/",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/138.0.0.0 Safari/537.36"
+                    ),
+                },
+            ) as response:
+                if response.status != 200:
+                    return []
+                page = await response.text()
+        except (aiohttp.ClientError, TimeoutError):
+            return []
+        return _parse_additional_media(page)
+
     async def fetch_post(self, url: str) -> SourcePost:
         url_author, _, source_id = self._parts(url)
         normalized = self.normalize_url(url)
@@ -78,6 +105,20 @@ class DeviantArtProvider(BaseProvider):
         mime_type = _mime_type(media_url, payload.get("imagetype"))
         extension = mimetypes.guess_extension(mime_type or "") or _extension(media_url)
         safety = str(payload.get("safety") or payload.get("rating") or "").strip().lower()
+        media_items = [MediaItem(
+            url=media_url,
+            preview_url=preview_url,
+            filename=f"deviantart_{source_id}{extension}",
+            order=0,
+            mime_type=mime_type,
+            width=_positive_int(payload.get("width")),
+            height=_positive_int(payload.get("height")),
+            headers={"Referer": normalized},
+        )]
+        for item in await self._additional_media(normalized):
+            media = _additional_media_item(item, source_id, len(media_items), normalized)
+            if media is not None and all(existing.url != media.url for existing in media_items):
+                media_items.append(media)
         return SourcePost(
             provider=self.name,
             source_id=source_id,
@@ -89,20 +130,86 @@ class DeviantArtProvider(BaseProvider):
             author_name=author_name,
             author_url=author_url,
             source_tags=_tags(payload.get("tags")),
-            media_items=[MediaItem(
-                url=media_url,
-                preview_url=preview_url,
-                filename=f"deviantart_{source_id}{extension}",
-                order=0,
-                mime_type=mime_type,
-                width=_positive_int(payload.get("width")),
-                height=_positive_int(payload.get("height")),
-                headers={"Referer": normalized},
-            )],
+            media_items=media_items,
             published_at=_parse_datetime(payload.get("pubdate") or payload.get("published_time")),
             content_warning=safety if safety not in {"", "general", "safe"} else None,
-            metadata={"oembed_type": payload.get("type"), "safety": safety or None},
+            metadata={
+                "oembed_type": payload.get("type"),
+                "safety": safety or None,
+                "page_count": len(media_items),
+            },
         )
+
+
+def _parse_additional_media(page: str) -> list[dict]:
+    # Eclipse serializes its page state both as ordinary JSON and as JSON with
+    # escaped quotes inside another string. Normalizing both forms keeps this
+    # parser independent from surrounding script markup.
+    normalized = html.unescape(page).replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+    for marker in re.finditer(r'"additionalMedia"\s*:\s*', normalized):
+        try:
+            value, _ = json.JSONDecoder().raw_decode(normalized, marker.end())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _additional_media_item(
+    item: dict, source_id: str, order: int, referer: str,
+) -> MediaItem | None:
+    media = item.get("media")
+    if not isinstance(media, dict):
+        return None
+    media_url, fullview = _eclipse_media_url(media, "fullview")
+    if not media_url:
+        return None
+    try:
+        media_url = validate_public_url(_absolute_url(media_url), DeviantArtProvider._media_hosts)
+    except InvalidUrlError:
+        return None
+    preview_url, _ = _eclipse_media_url(media, "preview")
+    try:
+        preview_url = (
+            validate_public_url(_absolute_url(preview_url), DeviantArtProvider._media_hosts)
+            if preview_url else media_url
+        )
+    except InvalidUrlError:
+        preview_url = media_url
+    mime_type = _mime_type(media_url, None)
+    extension = mimetypes.guess_extension(mime_type or "") or _extension(media_url)
+    return MediaItem(
+        url=media_url,
+        preview_url=preview_url,
+        filename=f"deviantart_{source_id}_p{order}{extension}",
+        order=order,
+        mime_type=mime_type,
+        width=_positive_int(fullview.get("w")),
+        height=_positive_int(fullview.get("h")),
+        headers={"Referer": referer},
+    )
+
+
+def _eclipse_media_url(media: dict, format_name: str) -> tuple[str, dict]:
+    base_uri = str(media.get("baseUri") or "").strip()
+    formats = {
+        str(item.get("t")): item
+        for item in media.get("types") or []
+        if isinstance(item, dict)
+    }
+    selected_format = formats.get(format_name) or {}
+    tokens = media.get("token") or []
+    if isinstance(tokens, str):
+        tokens = [tokens]
+    if base_uri and tokens:
+        if len(tokens) <= 1 and selected_format.get("c"):
+            base_uri += str(selected_format["c"]).replace(
+                "<prettyName>", str(media.get("prettyName") or "image")
+            )
+        separator = "&" if "?" in base_uri else "?"
+        base_uri += f"{separator}token={tokens[-1]}"
+    return base_uri, selected_format
 
 
 def _tags(value: object) -> list[str]:
@@ -121,7 +228,7 @@ def _parse_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(value)
     except ValueError:
         return None
 

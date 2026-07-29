@@ -706,7 +706,10 @@ def build_router(
         await state.set_state(CreatePublication.waiting_for_urls)
         await message.answer(
             "Шаг 1 из 3 · отправьте одну или несколько ссылок на публикации.\n\n"
-            "Канал будет выбран на следующем шаге; дополнительные параметры вводить не нужно.",
+            "Для альбома Pixiv или DeviantArt можно дописать номера изображений, "
+            "например <code>[1,3,5-7]</code>. Нумерация начинается с 1.\n\n"
+            "Канал будет выбран на следующем шаге.",
+            parse_mode="HTML",
             reply_markup=wizard_cancel_keyboard(),
         )
 

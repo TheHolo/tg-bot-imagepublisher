@@ -2,8 +2,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app.domain.exceptions import InvalidUrlError, SourceAccessDeniedError, TooManyMediaError, UnsupportedSourceError
-from app.providers.deviantart import DeviantArtProvider
+from app.domain.exceptions import (
+    InvalidUrlError,
+    SourceAccessDeniedError,
+    UnsupportedSourceError,
+)
+from app.providers.deviantart import DeviantArtProvider, _parse_additional_media
 from app.providers.direct_image import DirectImageProvider
 from app.providers.pixiv import PixivProvider, _parse_datetime
 from app.providers.registry import ProviderRegistry
@@ -26,16 +30,8 @@ def test_pixiv_source_date_parsing():
     assert _parse_datetime("not-a-date") is None
 
 
-async def test_pixiv_rejects_work_with_more_than_configured_image_limit():
-    provider = PixivProvider(Mock(), media_limit_enabled=True, max_images=10)
-    provider._json = AsyncMock(side_effect=[{}, [{} for _ in range(11)]])
-
-    with pytest.raises(TooManyMediaError, match="11 изображений.*10"):
-        await provider.fetch_post("https://www.pixiv.net/artworks/123")
-
-
-async def test_pixiv_image_limit_can_be_disabled():
-    provider = PixivProvider(Mock(), media_limit_enabled=False, max_images=10)
+async def test_pixiv_returns_all_pages_for_selection_before_limit_check():
+    provider = PixivProvider(Mock())
     pages = [
         {"urls": {"original": f"https://i.pximg.net/img-original/{index}.jpg"}, "width": 100, "height": 100}
         for index in range(11)
@@ -63,6 +59,7 @@ def test_invalid_deviantart_url():
 
 async def test_deviantart_oembed_is_mapped_to_source_post():
     provider = DeviantArtProvider(Mock())
+    provider._additional_media = AsyncMock(return_value=[])
     provider._oembed = AsyncMock(return_value={
         "type": "photo",
         "title": "Night City",
@@ -102,6 +99,7 @@ async def test_deviantart_oembed_is_mapped_to_source_post():
 
 async def test_deviantart_uses_available_url_when_fullsize_is_missing():
     provider = DeviantArtProvider(Mock())
+    provider._additional_media = AsyncMock(return_value=[])
     provider._oembed = AsyncMock(return_value={
         "title": "Available preview",
         "author_name": "Artist",
@@ -127,6 +125,46 @@ async def test_deviantart_rejects_post_without_accessible_image():
         await provider.fetch_post(
             "https://www.deviantart.com/artist/art/Private-work-987654321"
         )
+
+
+async def test_deviantart_additional_album_images_are_mapped_in_order():
+    provider = DeviantArtProvider(Mock())
+    provider._oembed = AsyncMock(return_value={
+        "title": "Album",
+        "fullsize_url": "https://images-wixmp.wixmp.com/first.jpg",
+    })
+    provider._additional_media = AsyncMock(return_value=[{
+        "fileId": 2,
+        "media": {
+            "baseUri": "https://images-wixmp.wixmp.com/f/album/",
+            "prettyName": "second.png",
+            "types": [
+                {"t": "preview", "c": "/v1/fill/w_400,h_300/second.png", "w": 400, "h": 300},
+                {"t": "fullview", "c": "/v1/fit/w_1600,h_1200/second.png", "w": 1600, "h": 1200},
+            ],
+            "token": ["public-token"],
+        },
+    }])
+
+    post = await provider.fetch_post("https://www.deviantart.com/artist/art/Album-987654321")
+
+    assert len(post.media_items) == 2
+    assert post.metadata["page_count"] == 2
+    assert post.media_items[1].order == 1
+    assert "/v1/fit/" in post.media_items[1].url
+    assert "token=public-token" in post.media_items[1].url
+    assert "/v1/fill/" in post.media_items[1].preview_url
+    assert post.media_items[1].width == 1600
+
+
+def test_deviantart_embedded_additional_media_json_is_parsed():
+    page = (
+        r'<script>{\"additionalMedia\":'
+        r'[{\"fileId\":2,\"media\":{\"baseUri\":\"https://images-wixmp.wixmp.com/f/x/\"}}],'
+        r'\"next\":true}</script>'
+    )
+
+    assert _parse_additional_media(page)[0]["fileId"] == 2
 
 
 def test_direct_provider_only_recognizes_images():

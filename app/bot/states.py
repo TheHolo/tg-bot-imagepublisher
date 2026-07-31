@@ -6,6 +6,7 @@ class EditPreview(StatesGroup):
     waiting_for_caption = State()
     waiting_for_title = State()
     waiting_for_description = State()
+    waiting_for_schedule = State()
 
 
 class CreatePublication(StatesGroup):

@@ -12,7 +12,7 @@ IN_PROGRESS_STATUSES = {
 
 
 def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> list[tuple[Job, datetime]]:
-    """Estimate publication slots independently for each channel."""
+    """Estimate regular interval slots and exact out-of-band schedules."""
     now = _aware_utc(now or datetime.now(UTC))
     grouped: dict[str, list[Job]] = defaultdict(list)
     for job in jobs:
@@ -29,17 +29,29 @@ def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> lis
             job for job in channel_jobs
             if job.status in IN_PROGRESS_STATUSES or job.force_publish
         ]
-        regular_jobs = [job for job in channel_jobs if job not in immediate_jobs]
+        scheduled_jobs = [
+            job for job in channel_jobs
+            if getattr(job, "scheduled_at", None) is not None
+            and job not in immediate_jobs
+        ]
+        regular_jobs = [
+            job for job in channel_jobs
+            if job not in immediate_jobs and job not in scheduled_jobs
+        ]
 
         latest_immediate: datetime | None = None
         for job in immediate_jobs:
             estimate = max(now, _aware_utc(job.next_attempt_at or now))
             result.append((job, estimate))
-            latest_immediate = max(latest_immediate or estimate, estimate)
+            if getattr(job, "scheduled_at", None) is None:
+                latest_immediate = max(latest_immediate or estimate, estimate)
 
         if latest_immediate is not None:
             # A manual/in-progress publication resets this channel's old timer.
             next_channel_slot = latest_immediate + interval
+
+        for job in scheduled_jobs:
+            result.append((job, _scheduled_available_at(job, now)))
 
         pending = list(regular_jobs)
         while pending:
@@ -80,17 +92,29 @@ def estimate_queue_schedule(jobs: list[Job], now: datetime | None = None) -> lis
 def next_queued_by_schedule(
     jobs: list[Job], now: datetime | None = None,
 ) -> tuple[Job, datetime] | None:
-    """Return the queued job with the earliest estimated publication time."""
+    """Return the regular or scheduled job with the earliest estimated time."""
     candidates = [
         (job, estimate)
         for job, estimate in estimate_queue_schedule(jobs, now)
-        if job.status == JobStatus.QUEUED
+        if job.status in {JobStatus.QUEUED, JobStatus.SCHEDULED}
     ]
     return min(
         candidates,
         key=lambda item: (_aware_utc(item[1]), _aware_utc(item[0].created_at), item[0].id),
         default=None,
     )
+
+
+def regular_queue_completion(
+    jobs: list[Job], now: datetime | None = None,
+) -> tuple[int, datetime | None]:
+    """Return waiting regular-job count and the time when that queue becomes empty."""
+    regular = [
+        (job, estimate)
+        for job, estimate in estimate_queue_schedule(jobs, now)
+        if job.status == JobStatus.QUEUED and not job.force_publish
+    ]
+    return len(regular), max((estimate for _, estimate in regular), default=None)
 
 
 def format_countdown(target: datetime, now: datetime | None = None) -> str:
@@ -134,7 +158,14 @@ def _job_available_at(job: Job, now: datetime) -> datetime:
     return max(
         now,
         _aware_utc(job.next_attempt_at or now),
-        _aware_utc(getattr(job, "scheduled_at", None) or now),
+    )
+
+
+def _scheduled_available_at(job: Job, now: datetime) -> datetime:
+    return max(
+        now,
+        _aware_utc(job.next_attempt_at or now),
+        _aware_utc(job.scheduled_at or now),
     )
 
 

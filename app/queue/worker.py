@@ -3,7 +3,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot
@@ -22,6 +22,18 @@ from app.services.translation_service import TranslationService
 from app.utils.tags import merge_tags
 
 logger = logging.getLogger(__name__)
+
+
+def update_channel_schedule_after_publication(
+    channel: Channel, job: Job, published_at: datetime,
+) -> None:
+    """Advance the regular interval only for publications from the regular queue."""
+    if job.scheduled_at is not None:
+        return
+    channel.next_publish_at = (
+        published_at + timedelta(seconds=channel.publish_interval_seconds)
+        if channel.publish_interval_seconds else None
+    )
 
 
 @dataclass(frozen=True)
@@ -156,10 +168,8 @@ class WorkerPool:
                 telegram_message_ids=result.message_ids, published_at=result.published_at, caption=caption,
             ))
             channel = await session.get(Channel, job.target_channel_id)
-            if channel and channel.publish_interval_seconds:
-                channel.next_publish_at = result.published_at + timedelta(seconds=channel.publish_interval_seconds)
-            elif channel:
-                channel.next_publish_at = None
+            if channel:
+                update_channel_schedule_after_publication(channel, job, result.published_at)
             for source, downloaded_item, prepared_item, message_id in zip(
                 post.media_items, downloaded, prepared, result.message_ids, strict=False
             ):

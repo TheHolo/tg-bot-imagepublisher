@@ -1,7 +1,8 @@
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import ColumnElement
@@ -13,6 +14,7 @@ from app.domain.models import SourcePost
 QUEUE_FILTER_STATUSES = {
     "active": ACTIVE_JOB_STATUSES,
     "queued": {JobStatus.QUEUED},
+    "scheduled": {JobStatus.SCHEDULED},
     "processing": {JobStatus.DOWNLOADING, JobStatus.PROCESSING, JobStatus.PUBLISHING},
     "failed": {JobStatus.FAILED},
     "completed": {JobStatus.COMPLETED},
@@ -181,7 +183,9 @@ class JobService:
     async def set_caption_override(self, job_id: int, caption: str | None) -> Job | None:
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
-            if not job or job.status not in {JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED}:
+            if not job or job.status not in {
+                JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED, JobStatus.SCHEDULED,
+            }:
                 return None
             job.caption_override = caption
             return job
@@ -232,40 +236,53 @@ class JobService:
                 job.attempts = 0
                 job.scheduled_at = None
                 job.force_publish = False
-            job.status = JobStatus.QUEUED
+            job.status = (
+                JobStatus.SCHEDULED if job.scheduled_at is not None else JobStatus.QUEUED
+            )
             job.cancel_requested = False
             job.error_code = job.error_message = None
             job.finished_at = None
-            job.queue_position = await self._next_queue_position(session, job.target_channel_id)
+            job.queue_position = (
+                None
+                if job.status == JobStatus.SCHEDULED
+                else await self._next_queue_position(session, job.target_channel_id)
+            )
             return True
 
     async def claim_next(self) -> Job | None:
         async with self.sessions() as session, session.begin():
             while True:
+                now = utcnow()
                 candidate = await session.execute(
-                    select(Job.id, Job.target_channel_id)
+                    select(Job.id, Job.target_channel_id, Job.status)
                     .join(Channel, Job.target_channel_id == Channel.id)
                     .where(
-                        Job.status == JobStatus.QUEUED,
+                        Job.status.in_({JobStatus.QUEUED, JobStatus.SCHEDULED}),
                         Job.cancel_requested.is_(False),
-                        or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= utcnow()),
+                        or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= now),
                         Channel.is_enabled.is_(True),
                         Channel.active_job_id.is_(None),
                         or_(Channel.is_paused.is_(False), Job.force_publish.is_(True)),
                         or_(
                             Job.force_publish.is_(True),
-                            Job.scheduled_at.is_(None),
-                            Job.scheduled_at <= utcnow(),
-                        ),
-                        or_(
-                            Job.force_publish.is_(True),
-                            Channel.next_publish_at.is_(None),
-                            Channel.next_publish_at <= utcnow(),
+                            and_(
+                                Job.status == JobStatus.SCHEDULED,
+                                Job.scheduled_at.is_not(None),
+                                Job.scheduled_at <= now,
+                            ),
+                            and_(
+                                Job.status == JobStatus.QUEUED,
+                                Job.scheduled_at.is_(None),
+                                or_(
+                                    Channel.next_publish_at.is_(None),
+                                    Channel.next_publish_at <= now,
+                                ),
+                            ),
                         ),
                     )
                     .order_by(
                         Job.force_publish.desc(),
-                        Job.scheduled_at.is_(None),
+                        case((Job.status == JobStatus.SCHEDULED, 0), else_=1),
                         Job.scheduled_at,
                         Job.queue_position.is_(None),
                         Job.queue_position,
@@ -277,7 +294,7 @@ class JobService:
                 row = candidate.first()
                 if row is None:
                     return None
-                candidate_id, channel_id = row
+                candidate_id, channel_id, candidate_status = row
                 reserved_channel_id = await session.scalar(
                     update(Channel)
                     .where(Channel.id == channel_id, Channel.active_job_id.is_(None))
@@ -288,7 +305,7 @@ class JobService:
                     continue
                 claimed_id = await session.scalar(
                     update(Job)
-                    .where(Job.id == candidate_id, Job.status == JobStatus.QUEUED)
+                    .where(Job.id == candidate_id, Job.status == candidate_status)
                     .values(
                         status=JobStatus.DOWNLOADING, attempts=Job.attempts + 1,
                         started_at=func.coalesce(Job.started_at, utcnow()), next_attempt_at=None,
@@ -309,12 +326,18 @@ class JobService:
     async def force_publish(self, job_id: int) -> Job | None:
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
-            if not job or job.status != JobStatus.QUEUED or job.cancel_requested:
+            if (
+                not job
+                or job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}
+                or job.cancel_requested
+            ):
                 return None
+            old_status = job.status
             job.force_publish = True
             job.scheduled_at = None
+            job.status = JobStatus.QUEUED
             session.add(JobEvent(
-                job_id=job.id, event_type="manual_publish", old_status=job.status,
+                job_id=job.id, event_type="manual_publish", old_status=old_status,
                 new_status=job.status, message="Manual publication requested",
             ))
             return job
@@ -326,6 +349,7 @@ class JobService:
                 .join(Channel, Job.target_channel_id == Channel.id)
                 .where(
                     Job.status == JobStatus.QUEUED,
+                    Job.scheduled_at.is_(None),
                     Job.cancel_requested.is_(False),
                     Channel.is_enabled.is_(True),
                 )
@@ -358,7 +382,12 @@ class JobService:
             job = await session.get(Job, job_id)
             if not job or job.status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
                 return False
-            if job.status in {JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED, JobStatus.FAILED}:
+            if job.status in {
+                JobStatus.WAITING_CONFIRMATION,
+                JobStatus.QUEUED,
+                JobStatus.SCHEDULED,
+                JobStatus.FAILED,
+            }:
                 job.status = JobStatus.CANCELLED
                 job.finished_at = utcnow()
             else:
@@ -377,8 +406,12 @@ class JobService:
                 return
             job.error_code = getattr(error, "code", type(error).__name__)
             job.error_message = str(error)[:2000]
-            job.status = JobStatus.QUEUED if retry and job.attempts < job.max_attempts else JobStatus.FAILED
-            if job.status == JobStatus.QUEUED:
+            retry_status = (
+                JobStatus.SCHEDULED
+                if job.scheduled_at is not None else JobStatus.QUEUED
+            )
+            job.status = retry_status if retry and job.attempts < job.max_attempts else JobStatus.FAILED
+            if job.status in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
                 delays = (5, 30, 120)
                 job.next_attempt_at = utcnow() + timedelta(seconds=delays[min(job.attempts - 1, len(delays) - 1)])
             if job.status == JobStatus.FAILED:
@@ -402,25 +435,73 @@ class JobService:
     async def set_schedule(self, job_id: int, scheduled_at: datetime | None) -> Job | None:
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
-            if not job or job.status != JobStatus.QUEUED:
+            if not job or job.status not in {
+                JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED, JobStatus.SCHEDULED,
+            }:
                 return None
+            old_status = job.status
             job.scheduled_at = scheduled_at
             if scheduled_at is not None:
                 job.force_publish = False
+                if job.status == JobStatus.QUEUED:
+                    job.status = JobStatus.SCHEDULED
+                    job.queue_position = None
+            elif job.status == JobStatus.SCHEDULED:
+                job.status = JobStatus.QUEUED
+                job.queue_position = await self._next_queue_position(
+                    session, job.target_channel_id,
+                )
+            session.add(JobEvent(
+                job_id=job.id,
+                event_type="schedule_changed",
+                old_status=old_status,
+                new_status=job.status,
+                message=scheduled_at.isoformat() if scheduled_at is not None else "Schedule cleared",
+            ))
             return job
+
+    async def shuffle_queued(self, channel_id: int) -> int:
+        """Randomize only regular queued jobs of one channel in a single transaction."""
+        async with self.sessions() as session, session.begin():
+            rows = list((await session.scalars(
+                select(Job)
+                .where(
+                    Job.target_channel_id == channel_id,
+                    Job.status == JobStatus.QUEUED,
+                    Job.scheduled_at.is_(None),
+                )
+                .order_by(
+                    Job.queue_position.is_(None), Job.queue_position, Job.created_at, Job.id,
+                )
+                .with_for_update()
+            )).all())
+            if len(rows) < 2:
+                return len(rows)
+            original_order = [job.id for job in rows]
+            random.shuffle(rows)
+            if [job.id for job in rows] == original_order:
+                rows.append(rows.pop(0))
+            for position, job in enumerate(rows, start=1):
+                job.queue_position = position
+            return len(rows)
 
     async def move_queued(self, job_id: int, direction: str) -> Job | None:
         if direction not in {"up", "down"}:
             raise ValueError(f"Unsupported direction: {direction}")
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
-            if not job or job.status != JobStatus.QUEUED:
+            if (
+                not job
+                or job.status != JobStatus.QUEUED
+                or job.scheduled_at is not None
+            ):
                 return None
             rows = list((await session.scalars(
                 select(Job)
                 .where(
                     Job.target_channel_id == job.target_channel_id,
                     Job.status == JobStatus.QUEUED,
+                    Job.scheduled_at.is_(None),
                 )
                 .order_by(
                     Job.queue_position.is_(None), Job.queue_position, Job.created_at, Job.id,
@@ -478,8 +559,14 @@ class JobService:
             if not job or job.status != JobStatus.WAITING_CONFIRMATION:
                 return False
             job.allow_duplicate = True
-            job.status = JobStatus.QUEUED
-            job.queue_position = await self._next_queue_position(session, job.target_channel_id)
+            job.status = (
+                JobStatus.SCHEDULED if job.scheduled_at is not None else JobStatus.QUEUED
+            )
+            job.queue_position = (
+                None
+                if job.status == JobStatus.SCHEDULED
+                else await self._next_queue_position(session, job.target_channel_id)
+            )
             return True
 
     async def queue(self, alias: str | None = None, limit: int | None = 50) -> list[Job] | None:
@@ -524,10 +611,15 @@ class JobService:
             )
             if channel_id is not None:
                 statement = statement.where(Job.target_channel_id == channel_id)
-            statement = statement.order_by(
-                Channel.alias, Job.queue_position.is_(None), Job.queue_position,
-                Job.created_at, Job.id,
-            )
+            if status_filter == "scheduled":
+                statement = statement.order_by(
+                    Channel.alias, Job.scheduled_at, Job.created_at, Job.id,
+                )
+            else:
+                statement = statement.order_by(
+                    Channel.alias, Job.queue_position.is_(None), Job.queue_position,
+                    Job.created_at, Job.id,
+                )
             if limit is not None:
                 statement = statement.limit(limit)
             return list((await session.scalars(statement)).all())
@@ -613,7 +705,14 @@ class JobService:
                 update(Job)
                 .where(*processing_conditions, Job.cancel_requested.is_(False))
                 .values(
-                    status=JobStatus.QUEUED,
+                    status=case(
+                        (Job.scheduled_at.is_not(None), JobStatus.SCHEDULED),
+                        else_=JobStatus.QUEUED,
+                    ),
+                    queue_position=case(
+                        (Job.scheduled_at.is_not(None), None),
+                        else_=Job.queue_position,
+                    ),
                     error_code="recovered_after_restart",
                     error_message="Recovered after restart",
                     next_attempt_at=None,
@@ -656,7 +755,10 @@ class JobService:
     @staticmethod
     async def _next_queue_position(session: AsyncSession, channel_id: int) -> int:
         current = await session.scalar(
-            select(func.max(Job.queue_position)).where(Job.target_channel_id == channel_id)
+            select(func.max(Job.queue_position)).where(
+                Job.target_channel_id == channel_id,
+                Job.status == JobStatus.QUEUED,
+            )
         )
         return int(current or 0) + 1
 

@@ -8,6 +8,7 @@ from app.bot.router import (
     preview_keyboard,
     queue_job_keyboard,
     queue_summary_line,
+    queue_total_line,
     queue_view_keyboard,
     queued_preview_keyboard,
     replace_channel_line,
@@ -20,12 +21,13 @@ from app.domain.enums import JobStatus
 def test_queued_preview_keyboard_has_expected_layout():
     keyboard = queued_preview_keyboard(42).inline_keyboard
 
-    assert [len(row) for row in keyboard] == [1, 2, 1, 1]
+    assert [len(row) for row in keyboard] == [1, 2, 1, 1, 1]
     assert [button.text for row in keyboard for button in row] == [
         "Опубликовать сейчас",
         "Заменить теги",
         "Добавить теги",
         "Изменить подпись",
+        "🕒 Назначить / изменить время",
         "Отменить публикацию",
     ]
     assert [button.callback_data for row in keyboard for button in row] == [
@@ -33,6 +35,7 @@ def test_queued_preview_keyboard_has_expected_layout():
         "preview_tags_replace:42",
         "preview_tags_add:42",
         "preview_caption:42",
+        "preview_schedule:42",
         "preview_cancel:42",
     ]
 
@@ -70,6 +73,7 @@ def test_initial_preview_keyboard_exposes_all_editing_steps_and_media():
         "description:42",
         "caption:42",
         "media:42",
+        "schedule:42",
     }
 
 
@@ -124,7 +128,28 @@ def test_queue_view_keyboard_exposes_all_status_filters():
         "failed",
         "completed",
         "cancelled",
+        "scheduled",
     }
+    assert "queue_shuffle:0:7:active" in callbacks
+
+
+def test_scheduled_job_keyboard_has_no_reordering_but_can_change_time():
+    job = Job(
+        id=42, status=JobStatus.SCHEDULED,
+        scheduled_at=datetime(2026, 7, 23, tzinfo=UTC),
+    )
+    callbacks = [
+        button.callback_data
+        for row in queue_job_keyboard(
+            job, page=0, scope=7, status_filter="scheduled",
+        ).inline_keyboard
+        for button in row
+    ]
+
+    assert not any(callback.startswith("queue_move:") for callback in callbacks)
+    assert "queue_schedule:0:7:scheduled:42" in callbacks
+    assert "queue_schedule_clear:0:7:scheduled:42" in callbacks
+    assert "queue_force:0:7:scheduled:42" in callbacks
 
 
 def test_channel_selection_keyboard_lists_channels_and_marks_current():
@@ -224,4 +249,19 @@ def test_channel_queue_summary_shows_count_and_total_time():
 
     assert queue_summary_line(7, now + timedelta(hours=13, minutes=53, seconds=10), now) == (
         "Всего постов: 7 · Вся очередь: через 13ч 53м 10с"
+    )
+
+    channel = Channel(
+        alias="art", telegram_chat_id="-1001", title="Art",
+        publish_interval_seconds=3600, next_publish_at=now,
+    )
+    jobs = [
+        Job(
+            id=index, status=JobStatus.QUEUED, channel=channel,
+            created_at=now, queue_position=index, force_publish=False,
+        )
+        for index in range(1, 4)
+    ]
+    assert queue_total_line(jobs, channel, now) == (
+        "Всего постов: 3 · Вся очередь: через 2ч"
     )

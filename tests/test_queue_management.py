@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+from sqlalchemy import select
+
 from app.db.models import Channel, Job, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
@@ -80,6 +82,8 @@ async def test_future_exact_time_blocks_claim_until_forced(tmp_path):
     engine, sessions, user_id, channel_id = await create_context(tmp_path, "schedule.db")
     async with sessions() as session, session.begin():
         job = queued_job(user_id, channel_id, "scheduled", 1)
+        job.status = JobStatus.SCHEDULED
+        job.queue_position = None
         job.scheduled_at = utcnow() + timedelta(hours=1)
         session.add(job)
         await session.flush()
@@ -90,6 +94,113 @@ async def test_future_exact_time_blocks_claim_until_forced(tmp_path):
     assert await jobs.force_publish(job_id) is not None
     claimed = await jobs.claim_next()
     assert claimed is not None and claimed.id == job_id
+    await engine.dispose()
+
+
+async def test_scheduled_job_bypasses_channel_interval_when_due(tmp_path):
+    engine, sessions, user_id, channel_id = await create_context(tmp_path, "due-schedule.db")
+    async with sessions() as session, session.begin():
+        channel = await session.get(Channel, channel_id)
+        channel.next_publish_at = utcnow() + timedelta(hours=2)
+        job = queued_job(user_id, channel_id, "due", 1)
+        job.status = JobStatus.SCHEDULED
+        job.queue_position = None
+        job.scheduled_at = utcnow() - timedelta(seconds=1)
+        session.add(job)
+        await session.flush()
+        job_id = job.id
+
+    claimed = await JobService(sessions).claim_next()
+
+    assert claimed is not None and claimed.id == job_id
+    await engine.dispose()
+
+
+async def test_setting_exact_time_moves_job_out_of_regular_queue_and_clear_restores_it(tmp_path):
+    engine, sessions, user_id, channel_id = await create_context(tmp_path, "set-schedule.db")
+    async with sessions() as session, session.begin():
+        first = queued_job(user_id, channel_id, "first", 1)
+        second = queued_job(user_id, channel_id, "second", 2)
+        session.add_all([first, second])
+        await session.flush()
+        first_id = first.id
+
+    jobs = JobService(sessions)
+    scheduled = await jobs.set_schedule(first_id, utcnow() + timedelta(hours=1))
+
+    assert scheduled is not None and scheduled.status == JobStatus.SCHEDULED
+    assert scheduled.queue_position is None
+    assert [job.source_id for job in await jobs.managed_queue(channel_id, "queued", None)] == ["second"]
+    assert [job.source_id for job in await jobs.managed_queue(channel_id, "scheduled", None)] == ["first"]
+
+    restored = await jobs.set_schedule(first_id, None)
+    assert restored is not None and restored.status == JobStatus.QUEUED
+    assert [job.source_id for job in await jobs.managed_queue(channel_id, "queued", None)] == [
+        "second", "first",
+    ]
+    await engine.dispose()
+
+
+async def test_preview_with_exact_time_enters_scheduled_status_on_confirmation(tmp_path):
+    engine, sessions, user_id, channel_id = await create_context(tmp_path, "preview-schedule.db")
+    async with sessions() as session, session.begin():
+        preview = queued_job(user_id, channel_id, "preview", 1)
+        preview.status = JobStatus.WAITING_CONFIRMATION
+        preview.queue_position = None
+        session.add(preview)
+        await session.flush()
+        preview_id = preview.id
+
+    jobs = JobService(sessions)
+    scheduled_at = utcnow() + timedelta(hours=1)
+    edited = await jobs.set_schedule(preview_id, scheduled_at)
+    assert edited is not None and edited.status == JobStatus.WAITING_CONFIRMATION
+    assert await jobs.enqueue(preview_id)
+
+    stored = await jobs.get(preview_id)
+    assert stored is not None and stored.status == JobStatus.SCHEDULED
+    assert stored.queue_position is None
+    assert stored.scheduled_at == scheduled_at.replace(tzinfo=None)
+    await engine.dispose()
+
+
+async def test_shuffle_changes_only_regular_waiting_jobs(tmp_path, monkeypatch):
+    engine, sessions, user_id, channel_id = await create_context(tmp_path, "shuffle.db")
+    async with sessions() as session, session.begin():
+        regular = [
+            queued_job(user_id, channel_id, source_id, position)
+            for position, source_id in enumerate(("first", "second", "third"), start=1)
+        ]
+        scheduled = queued_job(user_id, channel_id, "scheduled", 4)
+        scheduled.status = JobStatus.SCHEDULED
+        scheduled.queue_position = None
+        scheduled.scheduled_at = utcnow() + timedelta(hours=1)
+        cancelled = queued_job(user_id, channel_id, "cancelled", 5)
+        cancelled.status = JobStatus.CANCELLED
+        completed = queued_job(user_id, channel_id, "completed", 6)
+        completed.status = JobStatus.COMPLETED
+        session.add_all([*regular, scheduled, cancelled, completed])
+        await session.flush()
+        untouched = {
+            scheduled.id: (
+                str(scheduled.status), scheduled.queue_position,
+                scheduled.scheduled_at.replace(tzinfo=None),
+            ),
+            cancelled.id: (str(cancelled.status), cancelled.queue_position, cancelled.scheduled_at),
+            completed.id: (str(completed.status), completed.queue_position, completed.scheduled_at),
+        }
+
+    monkeypatch.setattr("app.services.job_service.random.shuffle", lambda rows: rows.reverse())
+    jobs = JobService(sessions)
+    assert await jobs.shuffle_queued(channel_id) == 3
+    assert [job.source_id for job in await jobs.managed_queue(channel_id, "queued", None)] == [
+        "third", "second", "first",
+    ]
+    async with sessions() as session:
+        stored = list((await session.scalars(select(Job).where(Job.id.in_(untouched)))).all())
+    assert {
+        job.id: (str(job.status), job.queue_position, job.scheduled_at) for job in stored
+    } == untouched
     await engine.dispose()
 
 

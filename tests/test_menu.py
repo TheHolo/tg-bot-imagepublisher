@@ -372,6 +372,7 @@ async def test_queue_callback_opens_filtered_management_screen():
     assert any(isinstance(request, AnswerCallbackQuery) for request in bot.requests)
     edit = next(request for request in bot.requests if isinstance(request, EditMessageText))
     assert "Очередь: channel-12" in edit.text
+    assert "Всего ожидают: 0 · Вся очередь: —" in edit.text
     assert "Заданий с таким статусом нет" in edit.text
     assert "queue_filter:1:12:active" in [
         button.callback_data for button in flatten(edit.reply_markup)
@@ -412,6 +413,29 @@ async def test_opening_registered_channel_captures_and_renders_subscribers():
     assert "24ч +12 (+0,98%)" in edit.text
     assert "7д -5 (-0,40%)" in edit.text
     assert "30д —" in edit.text
+    assert "0 запланировано" in edit.text
+    assert "Всего ожидают: 0 · Вся очередь: —" in edit.text
+
+
+async def test_shuffle_queue_callback_affects_selected_channel_and_refreshes_screen():
+    channel = make_channels()[0]
+    jobs = SimpleNamespace(
+        get_channel_by_id=AsyncMock(return_value=channel),
+        shuffle_queued=AsyncMock(return_value=3),
+        managed_queue=AsyncMock(return_value=[]),
+    )
+    router = make_router(jobs)
+    bot = RecordingBot()
+    callback = make_callback(bot, make_message(bot), "queue_shuffle:0:7:active")
+
+    await handler(router, "callback_query", "shuffle_channel_queue")(callback)
+
+    jobs.shuffle_queued.assert_awaited_once_with(7)
+    jobs.managed_queue.assert_awaited_once_with(7, "active", limit=None)
+    assert any(
+        isinstance(request, AnswerCallbackQuery) and "Перемешано заданий: 3" in request.text
+        for request in bot.requests
+    )
 
 
 async def test_queue_page_callback_replaces_markup_with_requested_page():
@@ -654,3 +678,37 @@ async def test_custom_caption_is_saved_and_returned_to_confirmation():
     answers = [request for request in bot.requests if isinstance(request, SendMessage)]
     assert "Custom &amp; safe" in answers[-1].text
     assert answers[-1].parse_mode == "HTML"
+
+
+async def test_initial_preview_schedule_is_saved_and_shown_in_confirmation():
+    post = make_post()
+    channel = make_channels()[0]
+    scheduled_at = datetime(2099, 12, 31, 8, 30, tzinfo=UTC)
+    updated = SimpleNamespace(id=42)
+    stored = SimpleNamespace(
+        id=42,
+        scheduled_at=scheduled_at,
+        post_data=serialize_post(post),
+        user_tags=[],
+        source_tags=[],
+        channel=channel,
+    )
+    jobs = SimpleNamespace(
+        set_schedule=AsyncMock(return_value=updated),
+        get=AsyncMock(return_value=stored),
+    )
+    previews = SimpleNamespace(caption=AsyncMock(return_value="Caption"))
+    router = make_router(jobs, previews=previews)
+    bot = RecordingBot()
+    message = make_message(bot, "31.12.2099 18:30")
+    state = make_state()
+    await state.set_state(EditPreview.waiting_for_schedule)
+    await state.set_data({"job_id": 42, "schedule_context": "initial"})
+
+    await handler(router, "message", "receive_preview_schedule")(message, state)
+
+    saved_time = jobs.set_schedule.await_args.args[1]
+    assert saved_time == scheduled_at
+    answers = [request for request in bot.requests if isinstance(request, SendMessage)]
+    assert any("Публикация запланирована" in answer.text for answer in answers)
+    assert "Время публикации: 31.12.2099 18:30" in answers[-1].text

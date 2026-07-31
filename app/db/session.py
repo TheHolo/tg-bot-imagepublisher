@@ -51,5 +51,9 @@ def _upgrade_schema(connection) -> None:
         connection.execute(text("UPDATE jobs SET queue_position = id WHERE queue_position IS NULL"))
     if "scheduled_at" not in job_columns:
         connection.execute(text("ALTER TABLE jobs ADD COLUMN scheduled_at TIMESTAMP NULL"))
+    connection.execute(text(
+        "UPDATE jobs SET status = 'scheduled', queue_position = NULL "
+        "WHERE status = 'queued' AND scheduled_at IS NOT NULL AND force_publish = FALSE"
+    ))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_queue_position ON jobs (queue_position)"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_scheduled_at ON jobs (scheduled_at)"))

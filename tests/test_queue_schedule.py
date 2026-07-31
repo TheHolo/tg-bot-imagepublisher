@@ -6,6 +6,7 @@ from app.utils.queue_schedule import (
     estimate_queue_schedule,
     format_countdown,
     next_queued_by_schedule,
+    regular_queue_completion,
 )
 
 
@@ -129,6 +130,7 @@ def test_queue_position_and_exact_time_affect_estimated_order():
         make_job(1, channel, now, queue_position=2),
         make_job(
             2, channel, now + timedelta(seconds=1), queue_position=1,
+            status=JobStatus.SCHEDULED,
             scheduled_at=now + timedelta(hours=1),
         ),
     ]
@@ -137,3 +139,27 @@ def test_queue_position_and_exact_time_affect_estimated_order():
 
     assert schedule[1] == now
     assert schedule[2] == now + timedelta(hours=1)
+
+
+def test_scheduled_publication_does_not_consume_regular_interval_slot():
+    now = datetime(2026, 7, 22, 0, 0, tzinfo=UTC)
+    channel = SimpleNamespace(
+        alias="art", publish_interval_seconds=600, next_publish_at=None,
+    )
+    jobs = [
+        make_job(1, channel, now, queue_position=1),
+        make_job(
+            2, channel, now, status=JobStatus.SCHEDULED,
+            scheduled_at=now + timedelta(minutes=5),
+        ),
+        make_job(3, channel, now, queue_position=2),
+    ]
+
+    schedule = {job.id: estimate for job, estimate in estimate_queue_schedule(jobs, now)}
+
+    assert schedule == {
+        1: now,
+        2: now + timedelta(minutes=5),
+        3: now + timedelta(minutes=10),
+    }
+    assert regular_queue_completion(jobs, now) == (2, now + timedelta(minutes=10))

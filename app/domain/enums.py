@@ -6,6 +6,7 @@ class JobStatus(StrEnum):
     RESOLVING = "resolving"
     WAITING_CONFIRMATION = "waiting_confirmation"
     QUEUED = "queued"
+    SCHEDULED = "scheduled"
     DOWNLOADING = "downloading"
     PROCESSING = "processing"
     PUBLISHING = "publishing"
@@ -16,6 +17,7 @@ class JobStatus(StrEnum):
 
 ACTIVE_JOB_STATUSES = {
     JobStatus.QUEUED,
+    JobStatus.SCHEDULED,
     JobStatus.DOWNLOADING,
     JobStatus.PROCESSING,
     JobStatus.PUBLISHING,

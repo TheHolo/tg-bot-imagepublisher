@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -63,6 +64,7 @@ from app.utils.queue_schedule import (
     estimate_queue_schedule,
     format_countdown,
     next_queued_by_schedule,
+    regular_queue_completion,
 )
 from app.utils.tags import hashtags, merge_tags, normalize_tags
 from app.utils.text import provider_label
@@ -107,6 +109,9 @@ def preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Изменить заголовок", callback_data=f"title:{job_id}"),
          InlineKeyboardButton(text="Изменить описание", callback_data=f"description:{job_id}")],
         [InlineKeyboardButton(text="Изменить подпись", callback_data=f"caption:{job_id}")],
+        [InlineKeyboardButton(
+            text="🕒 Назначить время", callback_data=f"schedule:{job_id}",
+        )],
         [InlineKeyboardButton(text="Показать медиа", callback_data=f"media:{job_id}")],
         [InlineKeyboardButton(text="Отмена", callback_data=f"cancel:{job_id}")],
     ])
@@ -125,6 +130,10 @@ def queued_preview_keyboard(job_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Заменить теги", callback_data=f"preview_tags_replace:{job_id}"),
          InlineKeyboardButton(text="Добавить теги", callback_data=f"preview_tags_add:{job_id}")],
         [InlineKeyboardButton(text="Изменить подпись", callback_data=f"preview_caption:{job_id}")],
+        [InlineKeyboardButton(
+            text="🕒 Назначить / изменить время",
+            callback_data=f"preview_schedule:{job_id}",
+        )],
         [InlineKeyboardButton(text="Отменить публикацию", callback_data=f"preview_cancel:{job_id}")],
     ])
 
@@ -150,6 +159,15 @@ def post_field_input_keyboard(job_id: int, field: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="Отмена ввода", callback_data=f"post_field_cancel:{field}:{job_id}",
+        )],
+    ])
+
+
+def preview_schedule_input_keyboard(job_id: int, context: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Отмена ввода",
+            callback_data=f"preview_schedule_cancel:{context}:{job_id}",
         )],
     ])
 
@@ -191,11 +209,31 @@ def channel_interval_input_keyboard(channel_id: int, page: int) -> InlineKeyboar
 QUEUE_FILTER_LABELS = {
     "active": "Активные",
     "queued": "Ожидают",
+    "scheduled": "Запланировано",
     "processing": "В работе",
     "failed": "Ошибки",
     "completed": "Готово",
     "cancelled": "Отменено",
 }
+
+JOB_STATUS_LABELS = {
+    JobStatus.WAITING_CONFIRMATION: "Подтверждение",
+    JobStatus.QUEUED: "Ожидает",
+    JobStatus.SCHEDULED: "Запланировано",
+    JobStatus.DOWNLOADING: "Загрузка",
+    JobStatus.PROCESSING: "Обработка",
+    JobStatus.PUBLISHING: "Публикация",
+    JobStatus.COMPLETED: "Опубликовано",
+    JobStatus.FAILED: "Ошибка",
+    JobStatus.CANCELLED: "Отменено",
+}
+
+
+def job_status_label(status: str) -> str:
+    try:
+        return JOB_STATUS_LABELS.get(JobStatus(status), status)
+    except ValueError:
+        return status
 
 
 def queue_view_keyboard(
@@ -211,7 +249,7 @@ def queue_view_keyboard(
     buttons = [filter_buttons[:3], filter_buttons[3:]]
     buttons.extend([
         [InlineKeyboardButton(
-            text=f"#{job.id} · {job.status} · {job.channel.alias}"[:64],
+            text=f"#{job.id} · {job_status_label(job.status)} · {job.channel.alias}"[:64],
             callback_data=f"queue_job:{page}:{scope}:{status_filter}:{job.id}",
         )]
         for job in rows[:15]
@@ -225,6 +263,11 @@ def queue_view_keyboard(
         buttons.append([InlineKeyboardButton(
             text="🔁 Повторить все неудачные",
             callback_data=f"queue_bulk_prompt:retry:{page}:{scope}:{status_filter}",
+        )])
+    if scope:
+        buttons.append([InlineKeyboardButton(
+            text="🔀 Перемешать ожидающие",
+            callback_data=f"queue_shuffle:{page}:{scope}:{status_filter}",
         )])
     buttons.extend([
         [InlineKeyboardButton(
@@ -240,16 +283,22 @@ def queue_job_keyboard(
 ) -> InlineKeyboardMarkup:
     context = f"{page}:{scope}:{status_filter}:{job.id}"
     rows: list[list[InlineKeyboardButton]] = []
-    if job.status == JobStatus.QUEUED:
-        rows.extend([
+    if job.status in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
+        if job.status == JobStatus.QUEUED:
+            rows.append(
             [
                 InlineKeyboardButton(text="⬆️ Выше", callback_data=f"queue_move:{context}:up"),
                 InlineKeyboardButton(text="⬇️ Ниже", callback_data=f"queue_move:{context}:down"),
-            ],
-            [InlineKeyboardButton(
-                text="🕒 Назначить точное время", callback_data=f"queue_schedule:{context}",
-            )],
-        ])
+            ]
+            )
+        rows.append([InlineKeyboardButton(
+            text=(
+                "🕒 Изменить точное время"
+                if job.status == JobStatus.SCHEDULED
+                else "🕒 Назначить точное время"
+            ),
+            callback_data=f"queue_schedule:{context}",
+        )])
         if job.scheduled_at is not None:
             rows.append([InlineKeyboardButton(
                 text="Сбросить точное время", callback_data=f"queue_schedule_clear:{context}",
@@ -349,6 +398,15 @@ def queue_summary_line(post_count: int, completion: datetime, now: datetime) -> 
     return f"Всего постов: {post_count} · Вся очередь: {format_countdown(completion, now)}"
 
 
+def queue_total_line(rows: list[Job], channel: Channel, now: datetime) -> str:
+    count, completion = regular_queue_completion(rows, now)
+    if count == 0 or completion is None:
+        return "Всего ожидают: 0 · Вся очередь: —"
+    if channel.is_paused:
+        return f"Всего ожидают: {count} · Вся очередь: после возобновления"
+    return queue_summary_line(count, completion, now)
+
+
 def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
     translator: TranslationService, health: HealthService,
@@ -360,6 +418,10 @@ def build_router(
         if not settings.auto_add_source_tags:
             return user_tags
         return merge_tags(user_tags, source_tags, settings.max_tags, settings.max_tag_length)
+
+    def schedule_example() -> str:
+        tomorrow = datetime.now(ZoneInfo(settings.timezone)) + timedelta(days=1)
+        return tomorrow.replace(second=0, microsecond=0).strftime("%d.%m.%Y %H:%M")
 
     async def channel_permission_text(channel: Channel, bot) -> str:
         try:
@@ -386,15 +448,17 @@ def build_router(
         channel: Channel, bot, *, capture_subscribers: bool = False,
     ) -> str:
         rows = await jobs.managed_queue(channel.id, "active", limit=None)
+        now = datetime.now(UTC)
         queued_count = sum(job.status == JobStatus.QUEUED for job in rows)
-        processing_count = len(rows) - queued_count
-        nearest = next_queued_by_schedule(rows)
+        scheduled_count = sum(job.status == JobStatus.SCHEDULED for job in rows)
+        processing_count = len(rows) - queued_count - scheduled_count
+        nearest = next_queued_by_schedule(rows, now)
         if nearest is None:
             nearest_text = "—"
         elif channel.is_paused and not nearest[0].force_publish:
             nearest_text = f"#{nearest[0].id} · после возобновления"
         else:
-            nearest_text = f"#{nearest[0].id} · {format_countdown(nearest[1])}"
+            nearest_text = f"#{nearest[0].id} · {format_countdown(nearest[1], now)}"
         if not channel.is_enabled:
             channel_status = "⚪ отключён конфигурацией"
         elif channel.is_paused:
@@ -414,7 +478,9 @@ def build_router(
         return (
             f"📡 <b>{escape(channel.title)}</b> · <code>{escape(channel.alias)}</code>{default}\n\n"
             f"Статус: {channel_status}\n"
-            f"Очередь: {queued_count} ожидают · {processing_count} в работе\n"
+            f"Очередь: {queued_count} ожидают · {scheduled_count} запланировано · "
+            f"{processing_count} в работе\n"
+            f"{queue_total_line(rows, channel, now)}\n"
             f"Ближайшая публикация: {nearest_text}\n"
             f"Режим: <code>{escape(channel.publish_mode)}</code>\n"
             f"Интервал: {format_duration(channel.publish_interval_seconds)}\n"
@@ -445,8 +511,11 @@ def build_router(
         lines = [
             f"📋 <b>Очередь: {scope_label}</b>",
             f"Фильтр: {QUEUE_FILTER_LABELS[status_filter]} · найдено {len(rows)}",
-            "",
         ]
+        now = datetime.now(UTC)
+        if channel is not None:
+            lines.append(queue_total_line(schedule_rows or [], channel, now))
+        lines.append("")
         estimates = {
             job.id: estimate
             for job, estimate in estimate_queue_schedule(schedule_rows or [])
@@ -454,17 +523,22 @@ def build_router(
         for job in rows[:15]:
             title = str(job.post_data.get("title") or "Без названия")
             suffix = ""
-            if job.channel.is_paused and job.status == JobStatus.QUEUED and not job.force_publish:
+            if (
+                job.channel.is_paused
+                and job.status in {JobStatus.QUEUED, JobStatus.SCHEDULED}
+                and not job.force_publish
+            ):
                 suffix = " · канал на паузе"
-            elif job.id in estimates:
-                suffix = f" · {format_countdown(estimates[job.id])}"
-            elif job.scheduled_at is not None:
+            elif job.status == JobStatus.SCHEDULED and job.scheduled_at is not None:
                 suffix = (
-                    " · "
-                    + format_schedule_datetime(job.scheduled_at, settings.timezone)
+                    " · " + format_schedule_datetime(job.scheduled_at, settings.timezone)
+                    + (f" · {format_countdown(estimates[job.id], now)}" if job.id in estimates else "")
                 )
+            elif job.id in estimates:
+                suffix = f" · {format_countdown(estimates[job.id], now)}"
             lines.append(
-                f"#{job.id} · {escape(str(job.status))} · {escape(job.channel.alias)}{suffix}\n"
+                f"#{job.id} · {escape(job_status_label(job.status))} · "
+                f"{escape(job.channel.alias)}{suffix}\n"
                 f"  {escape(title[:80])}"
             )
         if not rows:
@@ -488,7 +562,7 @@ def build_router(
             rows
             if status_filter == "active"
             else await jobs.managed_queue(scope or None, "active", limit=None)
-            if status_filter in {"queued", "processing"}
+            if scope or status_filter in {"queued", "scheduled", "processing"}
             else None
         )
         text = await queue_view_text(
@@ -524,13 +598,17 @@ def build_router(
         )
         lines = [
             f"📌 <b>Задание #{job.id}</b>",
-            f"Статус: {escape(str(job.status))}",
+            f"Статус: {escape(job_status_label(job.status))}",
             f"Канал: {escape(job.channel.alias)}",
             f"Название: {escape(post.title)}",
             f"Позиция: {job.queue_position or '—'}",
             f"Точное время ({escape(settings.timezone)}): {scheduled}",
             "Расчётное время: после возобновления"
-            if job.channel.is_paused and job.status == JobStatus.QUEUED and not job.force_publish
+            if (
+                job.channel.is_paused
+                and job.status in {JobStatus.QUEUED, JobStatus.SCHEDULED}
+                and not job.force_publish
+            )
             else f"Расчётное время: {format_countdown(estimate) if estimate else '—'}",
             f"Попытки: {job.attempts}/{job.max_attempts}",
         ]
@@ -576,6 +654,10 @@ def build_router(
         combined_tags = effective_tags(stored.user_tags, stored.source_tags)
         prefix = f"Ссылка {position}/{total}\n\n" if total > 1 else ""
         caption = await previews.caption(stored)
+        publication_time = (
+            format_schedule_datetime(stored.scheduled_at, settings.timezone)
+            if getattr(stored, "scheduled_at", None) is not None else "по очереди"
+        )
         return stored, (
             prefix
             + f"Источник: {escape(provider_label(post.provider))}\n"
@@ -583,6 +665,7 @@ def build_router(
             + f"Название: {escape(post.title)}\n"
             + f"Файлов: {len(post.media_items)}\n"
             + f"Канал: {escape(stored.channel.alias)}\n\n"
+            + f"Время публикации: {escape(publication_time)}\n\n"
             + f"Теги: {hashtags(combined_tags) or '—'}\n\n"
             + "<b>Итоговая подпись</b>\n"
             + caption
@@ -1085,13 +1168,7 @@ def build_router(
                 f"{' · вручную' if job.force_publish else ''}{exact}"
             )
         if alias:
-            completion = max(estimate for _, estimate in schedule)
-            lines.insert(
-                0,
-                f"Всего постов: {len(rows)} · канал на паузе"
-                if rows[0].channel.is_paused
-                else queue_summary_line(len(rows), completion, now),
-            )
+            lines.insert(0, queue_total_line(rows, rows[0].channel, now))
         if len(schedule) > 50:
             lines.append(f"…показаны ближайшие 50 из {len(schedule)} заданий.")
         return "\n".join(lines)
@@ -1267,7 +1344,7 @@ def build_router(
             await callback.answer("Некорректное задание.", show_alert=True)
             return
         job = await jobs.get(int(raw_job_id))
-        if job is None or job.status != JobStatus.QUEUED:
+        if job is None or job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
             await callback.answer("Задание уже нельзя запланировать.", show_alert=True)
             return
         await state.set_state(ManageQueue.waiting_for_schedule)
@@ -1279,7 +1356,7 @@ def build_router(
         })
         await message.edit_text(
             f"Введите точное время публикации в часовом поясе {escape(settings.timezone)}.\n"
-            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например 29.07.2026 18:30.",
+            f"Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например {schedule_example()}.",
             parse_mode="HTML",
             reply_markup=schedule_input_keyboard(
                 job.id,
@@ -1358,6 +1435,38 @@ def build_router(
                 ),
             )
 
+    @router.callback_query(F.data.startswith("queue_shuffle:"))
+    async def shuffle_channel_queue(callback: CallbackQuery) -> None:
+        message = await menu_callback_message(callback)
+        if message is None or callback.data is None:
+            return
+        parts = callback.data.split(":", 3)
+        if (
+            len(parts) != 4
+            or not parts[1].isdigit()
+            or not parts[2].isdigit()
+            or int(parts[2]) == 0
+            or parts[3] not in QUEUE_FILTER_STATUSES
+        ):
+            await callback.answer("Некорректная операция.", show_alert=True)
+            return
+        page, scope, status_filter = int(parts[1]), int(parts[2]), parts[3]
+        channel = await jobs.get_channel_by_id(scope)
+        if channel is None or not channel.is_enabled:
+            await callback.answer("Канал удалён или отключён.", show_alert=True)
+            return
+        count = await jobs.shuffle_queued(scope)
+        if count < 2:
+            await callback.answer(
+                "Для перемешивания нужно минимум два ожидающих задания.",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(f"Перемешано заданий: {count}.")
+        await edit_queue_view(
+            message, page=page, scope=scope, status_filter=status_filter,
+        )
+
     @router.callback_query(F.data.startswith("queue_job_preview:"))
     async def preview_queue_job(callback: CallbackQuery) -> None:
         message = await menu_callback_message(callback)
@@ -1365,7 +1474,7 @@ def build_router(
             return
         job_id = int(callback.data.rsplit(":", 1)[1])
         job = await jobs.get(job_id)
-        if job is None or job.status != JobStatus.QUEUED:
+        if job is None or job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
             await callback.answer("Предпросмотр уже недоступен.", show_alert=True)
             return
         await callback.answer("Готовлю медиа…")
@@ -1558,7 +1667,7 @@ def build_router(
                 )
             )
             return
-        if job.status != JobStatus.QUEUED:
+        if job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
             await message.answer(f"Задание #{job.id} уже не находится в очереди.")
             return
         try:
@@ -1647,7 +1756,7 @@ def build_router(
         action, raw_job_id = callback.data.rsplit(":", 1)
         job_id = int(raw_job_id)
         job = await jobs.get(job_id)
-        if not job or job.status != JobStatus.QUEUED:
+        if not job or job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
             await callback.answer("Задание уже не находится в очереди.", show_alert=True)
             return
         mode = "add" if action == "preview_tags_add" else "replace"
@@ -1673,8 +1782,11 @@ def build_router(
         is_queued = callback.data.startswith("preview_caption:")
         job_id = int(callback.data.rsplit(":", 1)[1])
         job = await jobs.get(job_id)
-        expected_status = JobStatus.QUEUED if is_queued else JobStatus.WAITING_CONFIRMATION
-        if not job or job.status != expected_status:
+        expected_statuses = (
+            {JobStatus.QUEUED, JobStatus.SCHEDULED}
+            if is_queued else {JobStatus.WAITING_CONFIRMATION}
+        )
+        if not job or job.status not in expected_statuses:
             await callback.answer("Подпись этого задания уже нельзя изменить.", show_alert=True)
             return
         current_caption = await previews.caption(job)
@@ -1689,6 +1801,94 @@ def build_router(
             "Отправьте новую подпись обычным текстом. Максимум — 1024 символа.",
             parse_mode="HTML",
             reply_markup=caption_input_keyboard(job_id),
+        )
+        await callback.answer()
+
+    @router.callback_query(
+        F.data.startswith("schedule:") | F.data.startswith("preview_schedule:")
+    )
+    async def edit_preview_schedule(callback: CallbackQuery, state: FSMContext) -> None:
+        queued = callback.data.startswith("preview_schedule:")
+        job_id = int(callback.data.rsplit(":", 1)[1])
+        job = await jobs.get(job_id)
+        allowed_statuses = (
+            {JobStatus.QUEUED, JobStatus.SCHEDULED}
+            if queued else {JobStatus.WAITING_CONFIRMATION}
+        )
+        if not job or job.status not in allowed_statuses:
+            await callback.answer("Время этого задания уже нельзя изменить.", show_alert=True)
+            return
+        context = "queued" if queued else "initial"
+        await state.set_state(EditPreview.waiting_for_schedule)
+        await state.set_data({"job_id": job_id, "schedule_context": context})
+        current = (
+            "\nТекущее время: "
+            + format_schedule_datetime(job.scheduled_at, settings.timezone)
+            if job.scheduled_at is not None else ""
+        )
+        await callback.message.answer(
+            f"Введите точное время публикации в часовом поясе {escape(settings.timezone)}.\n"
+            f"Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например {schedule_example()}.\n"
+            "Отправьте <code>-</code>, чтобы вернуть публикацию в обычную очередь."
+            f"{current}",
+            parse_mode="HTML",
+            reply_markup=preview_schedule_input_keyboard(job_id, context),
+        )
+        await callback.answer()
+
+    @router.message(EditPreview.waiting_for_schedule)
+    async def receive_preview_schedule(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        job_id = data.get("job_id")
+        context = data.get("schedule_context")
+        if not isinstance(job_id, int) or context not in {"initial", "queued"}:
+            await state.clear()
+            await message.answer("Экран назначения времени устарел.")
+            return
+        raw_value = (message.text or "").strip()
+        try:
+            scheduled_at = (
+                None
+                if raw_value == "-"
+                else parse_schedule_datetime(raw_value, settings.timezone)
+            )
+        except ValueError as error:
+            await message.answer(
+                str(error),
+                reply_markup=preview_schedule_input_keyboard(job_id, context),
+            )
+            return
+        job = await jobs.set_schedule(job_id, scheduled_at)
+        await state.clear()
+        if job is None:
+            await message.answer("Время этого задания уже нельзя изменить.")
+            return
+        wakeup.set()
+        await message.answer(
+            "Точное время сброшено — публикация вернулась в обычную очередь."
+            if scheduled_at is None
+            else (
+                "Публикация запланирована на "
+                f"{format_schedule_datetime(scheduled_at, settings.timezone)}."
+            )
+        )
+        await send_confirmation(message, job, queued=context == "queued")
+
+    @router.callback_query(F.data.startswith("preview_schedule_cancel:"))
+    async def cancel_preview_schedule(callback: CallbackQuery, state: FSMContext) -> None:
+        _, context, raw_job_id = callback.data.split(":", 2)
+        job_id = int(raw_job_id)
+        data = await state.get_data()
+        if data.get("job_id") != job_id or data.get("schedule_context") != context:
+            await callback.answer("Ввод времени уже завершён.", show_alert=True)
+            return
+        await state.clear()
+        await callback.message.edit_text(
+            "Назначение времени отменено.",
+            reply_markup=(
+                queued_preview_keyboard(job_id)
+                if context == "queued" else preview_keyboard(job_id)
+            ),
         )
         await callback.answer()
 
@@ -1869,7 +2069,14 @@ def build_router(
         job_id = int(callback.data.split(":", 1)[1])
         if await jobs.enqueue(job_id):
             wakeup.set()
-            await callback.message.edit_text(f"Задание #{job_id} добавлено в очередь.")
+            job = await jobs.get(job_id)
+            if job is not None and job.status == JobStatus.SCHEDULED:
+                await callback.message.edit_text(
+                    f"Задание #{job_id} запланировано на "
+                    f"{format_schedule_datetime(job.scheduled_at, settings.timezone)}."
+                )
+            else:
+                await callback.message.edit_text(f"Задание #{job_id} добавлено в очередь.")
         else:
             await callback.answer("Задание уже обработано.", show_alert=True)
         await callback.answer()
@@ -1879,7 +2086,16 @@ def build_router(
         job_id = int(callback.data.split(":", 1)[1])
         if await jobs.allow_duplicate_and_enqueue(job_id):
             wakeup.set()
-            await callback.message.edit_text(f"Повторная публикация #{job_id} подтверждена и добавлена в очередь.")
+            job = await jobs.get(job_id)
+            if job is not None and job.status == JobStatus.SCHEDULED:
+                await callback.message.edit_text(
+                    f"Повторная публикация #{job_id} запланирована на "
+                    f"{format_schedule_datetime(job.scheduled_at, settings.timezone)}."
+                )
+            else:
+                await callback.message.edit_text(
+                    f"Повторная публикация #{job_id} подтверждена и добавлена в очередь."
+                )
         else:
             await callback.answer("Задание уже обработано.", show_alert=True)
         await callback.answer()
@@ -1995,11 +2211,12 @@ def build_router(
     async def receive_tags(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         job = await jobs.get(data["job_id"])
-        expected_status = (
-            JobStatus.QUEUED if data.get("tag_context") == "queued_preview"
-            else JobStatus.WAITING_CONFIRMATION
+        expected_statuses = (
+            {JobStatus.QUEUED, JobStatus.SCHEDULED}
+            if data.get("tag_context") == "queued_preview"
+            else {JobStatus.WAITING_CONFIRMATION}
         )
-        if not job or job.status != expected_status:
+        if not job or job.status not in expected_statuses:
             await state.clear()
             await message.answer("Предпросмотр уже недоступен.")
             return

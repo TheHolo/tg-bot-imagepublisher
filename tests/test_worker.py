@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -7,7 +8,7 @@ from app.domain.enums import JobStatus
 from app.domain.exceptions import DownloadError, UncertainPublishError
 from app.domain.models import DownloadedMedia, MediaItem, PreparedMedia, SourcePost
 from app.queue import worker as worker_module
-from app.queue.worker import WorkerPool
+from app.queue.worker import WorkerPool, update_channel_schedule_after_publication
 from app.services.job_service import serialize_post
 
 
@@ -111,3 +112,20 @@ async def test_worker_snapshot_reports_only_current_job_as_busy():
 
     waiting.cancel()
     await asyncio.gather(waiting, return_exceptions=True)
+
+
+def test_scheduled_publication_does_not_shift_regular_channel_interval():
+    published_at = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+    original_next = published_at - timedelta(minutes=5)
+    channel = SimpleNamespace(
+        publish_interval_seconds=3600, next_publish_at=original_next,
+    )
+    scheduled = SimpleNamespace(scheduled_at=published_at)
+
+    update_channel_schedule_after_publication(channel, scheduled, published_at)
+
+    assert channel.next_publish_at == original_next
+
+    regular = SimpleNamespace(scheduled_at=None)
+    update_channel_schedule_after_publication(channel, regular, published_at)
+    assert channel.next_publish_at == published_at + timedelta(hours=1)

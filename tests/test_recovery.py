@@ -1,6 +1,8 @@
+from datetime import timedelta
+
 from sqlalchemy import inspect, select, text
 
-from app.db.models import Channel, Job, User
+from app.db.models import Channel, Job, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
 from app.services.job_service import JobService
@@ -40,6 +42,34 @@ async def test_existing_database_gets_additive_columns(tmp_path):
     await engine.dispose()
 
 
+async def test_startup_migrates_legacy_queued_exact_times_to_scheduled(tmp_path):
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'scheduled-status.db'}")
+    await create_schema(engine)
+    async with sessions() as session, session.begin():
+        user = User(telegram_user_id=1)
+        channel = Channel(alias="main", telegram_chat_id="-1001", title="Main")
+        session.add_all([user, channel])
+        await session.flush()
+        job = Job(
+            created_by_user_id=user.id, provider="direct", source_id="legacy-scheduled",
+            source_url="https://x/scheduled.jpg", normalized_url="https://x/scheduled.jpg",
+            target_channel_id=channel.id, status=JobStatus.QUEUED,
+            scheduled_at=utcnow() + timedelta(hours=1), queue_position=7,
+            post_data={}, user_tags=[], source_tags=[],
+        )
+        session.add(job)
+        await session.flush()
+        job_id = job.id
+
+    await create_schema(engine)
+
+    async with sessions() as session:
+        stored = await session.get(Job, job_id)
+    assert stored.status == JobStatus.SCHEDULED
+    assert stored.queue_position is None
+    await engine.dispose()
+
+
 async def test_startup_recovery_handles_fresh_jobs_and_releases_channel_leases(tmp_path):
     engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}")
     await create_schema(engine)
@@ -67,6 +97,7 @@ async def test_startup_recovery_handles_fresh_jobs_and_releases_channel_leases(t
                 ]
             )
         ]
+        jobs[1].scheduled_at = utcnow() + timedelta(hours=1)
         session.add_all(jobs)
         await session.flush()
         for channel, job in zip(channels, jobs, strict=True):
@@ -86,7 +117,7 @@ async def test_startup_recovery_handles_fresh_jobs_and_releases_channel_leases(t
     assert recovered == 4
     assert [job.status for job in stored_jobs] == [
         JobStatus.QUEUED,
-        JobStatus.QUEUED,
+        JobStatus.SCHEDULED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
     ]

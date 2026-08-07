@@ -16,6 +16,7 @@ from app.config import Settings
 from app.db.models import Channel
 from app.db.session import create_database, create_schema
 from app.news.api import NewsApiServer
+from app.news.http import PublicOnlyResolver
 from app.providers.deviantart import DeviantArtProvider
 from app.providers.direct_image import DirectImageProvider
 from app.providers.pixiv import PixivProvider
@@ -72,7 +73,7 @@ async def bootstrap(settings: Settings | None = None) -> Application:
     await create_schema(engine)
     await _sync_channels(sessions, settings)
     timeout = aiohttp.ClientTimeout(total=settings.download_timeout)
-    connector = None
+    connector = aiohttp.TCPConnector(resolver=PublicOnlyResolver())
     proxy_url = settings.proxy_url
     default_proxy = proxy_url
     if proxy_url and proxy_url.lower().startswith(("socks4://", "socks5://")):
@@ -82,6 +83,12 @@ async def bootstrap(settings: Settings | None = None) -> Application:
             raise RuntimeError("Для SOCKS-прокси установите зависимости: pip install -e '.[proxy]'") from error
         connector = ProxyConnector.from_url(proxy_url)
         default_proxy = None
+    elif proxy_url:
+        # The connector resolves the configured proxy rather than the final URL.
+        # User-supplied destinations still receive the explicit DNS preflight in
+        # DownloadService; direct connections additionally close the rebinding gap.
+        await connector.close()
+        connector = None
     http = aiohttp.ClientSession(
         timeout=timeout, headers={"User-Agent": "TelegramImagePublisher/0.1"},
         connector=connector, proxy=default_proxy,

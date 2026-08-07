@@ -1,8 +1,9 @@
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 
-from app.domain.exceptions import MediaTooLargeError
+from app.domain.exceptions import DownloadError, MediaTooLargeError
 from app.domain.models import MediaItem
 from app.services import download_service
 from app.services.download_service import DownloadService
@@ -36,6 +37,11 @@ class FakeSession:
 
     def get(self, *args, **kwargs) -> FakeResponse:
         return self.response
+
+
+class FailingSession:
+    def get(self, *args, **kwargs):
+        raise aiohttp.ClientConnectionError("connection failed")
 
 
 def media_item() -> MediaItem:
@@ -87,3 +93,28 @@ async def test_download_at_limit_is_saved_atomically(tmp_path, monkeypatch):
     assert downloaded.path.read_bytes() == b"a" * 60 + b"b" * 40
     assert list(tmp_path.rglob("*.part")) == []
     public_dns.assert_awaited_once_with(media_item().url)
+
+
+async def test_download_treats_invalid_content_length_as_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(download_service, "ensure_public_dns", AsyncMock())
+    response = FakeResponse(
+        headers={"Content-Type": "image/png", "Content-Length": "invalid"},
+        chunks=[b"image"],
+    )
+    service = DownloadService(FakeSession(response), tmp_path, max_size=100)
+
+    downloaded = await service.download(8, media_item())
+
+    assert downloaded.size == 5
+    assert downloaded.path.read_bytes() == b"image"
+
+
+async def test_network_failure_becomes_retryable_download_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(download_service, "ensure_public_dns", AsyncMock())
+    service = DownloadService(FailingSession(), tmp_path, max_size=100)
+
+    with pytest.raises(DownloadError) as caught:
+        await service.download(9, media_item())
+
+    assert caught.value.retryable is True
+    assert list(tmp_path.rglob("*.part")) == []

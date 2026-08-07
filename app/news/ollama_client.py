@@ -477,8 +477,8 @@ def _split_text(text: str, limit: int) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
     current_length = 0
-    for paragraph in clean.splitlines():
-        paragraph = paragraph.strip()
+    for raw_paragraph in clean.splitlines():
+        paragraph = raw_paragraph.strip()
         if not paragraph:
             continue
         parts = [paragraph[index : index + limit] for index in range(0, len(paragraph), limit)]

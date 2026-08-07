@@ -105,12 +105,15 @@ class Settings(BaseSettings):
         if parsed is None:
             return {}
         if not isinstance(parsed, dict):
-            raise ValueError("channels_json must be a JSON object")
+            # Pydantic validators must raise ValueError to produce a field validation error.
+            raise ValueError("channels_json must be a JSON object")  # noqa: TRY004
 
         channels: dict[str, dict[str, Any]] = {}
         for alias, settings in parsed.items():
             if not isinstance(alias, str) or not isinstance(settings, dict):
-                raise ValueError("each channel must have a string alias and an object value")
+                raise ValueError(  # noqa: TRY004
+                    "each channel must have a string alias and an object value"
+                )
             channels[alias] = settings
         return channels
 

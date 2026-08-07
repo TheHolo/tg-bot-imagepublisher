@@ -4,7 +4,25 @@ from unittest.mock import AsyncMock, Mock
 
 from app.domain.models import DownloadedMedia, MediaItem, PreparedMedia, SourcePost
 from app.services.job_service import serialize_post
-from app.services.preview_service import PreviewService
+from app.services.preview_service import PreviewService, deserialize_post
+
+
+def test_post_serialization_preserves_content_warning():
+    post = SourcePost(
+        provider="deviantart",
+        source_id="1",
+        source_url="https://example.com/post",
+        normalized_url="https://example.com/post",
+        title="Title",
+        author_name="Author",
+        author_url="https://example.com/author",
+        media_items=[],
+        content_warning="adult",
+    )
+
+    restored = deserialize_post(serialize_post(post))
+
+    assert restored.content_warning == "adult"
 
 
 async def test_preview_downloads_lightweight_url_instead_of_original(tmp_path):

@@ -131,7 +131,8 @@ class NewsTaskService:
                 if claimed_id is None:
                     continue
                 task = await session.get(NewsTask, claimed_id)
-                assert task is not None
+                if task is None:
+                    raise NewsTaskLeaseError("Выданная задача больше не существует")
                 return WorkerTask.model_validate({
                     "id": task.id,
                     "lease_token": token,
@@ -191,7 +192,8 @@ class NewsTaskService:
             if claimed_id is None:
                 raise NewsTaskLeaseError("Аренда задачи недействительна")
             task = await session.get(NewsTask, claimed_id)
-            assert task is not None
+            if task is None:
+                raise NewsTaskLeaseError("Задача больше не существует")
             if result.source.kind.value != task.source_kind:
                 raise ValueError("Тип обработанного источника не совпадает с задачей")
             if task.job_id is not None:

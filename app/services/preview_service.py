@@ -25,6 +25,7 @@ def deserialize_post(data: dict) -> SourcePost:
         source_tags=data.get("source_tags", []), media_items=items,
         content_kind=ContentKind(data.get("content_kind", "artwork")),
         body=data.get("body", ""),
+        content_warning=data.get("content_warning"),
         published_at=datetime.fromisoformat(data["published_at"]) if data.get("published_at") else None,
         metadata=data.get("metadata", {}),
     )

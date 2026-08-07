@@ -1,6 +1,6 @@
 import asyncio
-from html import unescape
 import logging
+from html import unescape
 
 import aiohttp
 

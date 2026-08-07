@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import re
 import socket
+from collections.abc import Collection
 from urllib.parse import urlsplit
 
 from app.domain.exceptions import InvalidUrlError
@@ -13,9 +14,14 @@ def extract_urls(text: str) -> list[str]:
     return [match.rstrip(".,;:!?)]}") for match in URL_RE.findall(text)]
 
 
-def validate_public_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+def validate_public_url(url: str, allowed_hosts: Collection[str] | None = None) -> str:
     parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise InvalidUrlError("Некорректный URL")
     host = parsed.hostname.rstrip(".").lower()
     if allowed_hosts and not any(host == item or host.endswith(f".{item}") for item in allowed_hosts):

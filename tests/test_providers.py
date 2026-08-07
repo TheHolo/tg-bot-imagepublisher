@@ -4,6 +4,7 @@ import pytest
 
 from app.domain.exceptions import (
     InvalidUrlError,
+    MediaTooLargeError,
     SourceAccessDeniedError,
     UnsupportedSourceError,
 )
@@ -11,6 +12,28 @@ from app.providers.deviantart import DeviantArtProvider, _parse_additional_media
 from app.providers.direct_image import DirectImageProvider
 from app.providers.pixiv import PixivProvider, _parse_datetime
 from app.providers.registry import ProviderRegistry
+
+
+class FakeResponse:
+    def __init__(self, status: int, headers: dict[str, str]) -> None:
+        self.status = status
+        self.headers = headers
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class FakeSession:
+    def __init__(self, response: FakeResponse) -> None:
+        self.response = response
+        self.requests: list[tuple[tuple, dict]] = []
+
+    def get(self, *args, **kwargs):
+        self.requests.append((args, kwargs))
+        return self.response
 
 
 def test_pixiv_urls_are_normalized():
@@ -171,6 +194,45 @@ def test_direct_provider_only_recognizes_images():
     provider = DirectImageProvider(Mock(), 1024)
     assert provider.can_handle("https://example.com/picture.webp")
     assert not provider.can_handle("https://example.com/page.html")
+
+
+async def test_direct_provider_maps_valid_image_response(monkeypatch):
+    response = FakeResponse(
+        206,
+        {
+            "Content-Type": "image/jpeg; charset=binary",
+            "Content-Length": "1",
+            "Content-Range": "bytes 0-0/1200",
+        },
+    )
+    session = FakeSession(response)
+    provider = DirectImageProvider(session, 2000)
+    public_dns = AsyncMock()
+    monkeypatch.setattr("app.providers.direct_image.ensure_public_dns", public_dns)
+
+    post = await provider.fetch_post("https://example.com/My%20Image.jpg")
+
+    assert post.title == "My Image"
+    assert post.media_items[0].filename == "My Image.jpg"
+    assert post.media_items[0].size == 1200
+    assert session.requests[0][1]["allow_redirects"] is False
+    public_dns.assert_awaited_once_with("https://example.com/My%20Image.jpg")
+
+
+async def test_direct_provider_uses_range_total_for_size_limit(monkeypatch):
+    response = FakeResponse(
+        206,
+        {
+            "Content-Type": "image/png",
+            "Content-Length": "1",
+            "Content-Range": "bytes 0-0/5000",
+        },
+    )
+    provider = DirectImageProvider(FakeSession(response), 1000)
+    monkeypatch.setattr("app.providers.direct_image.ensure_public_dns", AsyncMock())
+
+    with pytest.raises(MediaTooLargeError):
+        await provider.fetch_post("https://example.com/image.png")
 
 
 def test_registry_unsupported_source():

@@ -42,7 +42,16 @@ def test_no_url():
         parse_submission("only tags")
 
 
-@pytest.mark.parametrize("url", ["http://127.0.0.1/a.jpg", "http://[::1]/a.png", "ftp://example.com/a.jpg"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/a.jpg",
+        "http://[::1]/a.png",
+        "ftp://example.com/a.jpg",
+        "https://user:secret@example.com/a.jpg",
+        "https://:secret@example.com/a.jpg",
+    ],
+)
 def test_private_or_invalid_urls_rejected(url):
     with pytest.raises(InvalidUrlError):
         validate_public_url(url)
@@ -95,3 +104,8 @@ def test_invalid_media_selection_is_rejected(selection):
 def test_unclosed_media_selection_is_rejected():
     with pytest.raises(InvalidMediaSelectionError, match="Не закрыта"):
         parse_submission_batch("https://www.pixiv.net/artworks/1 [1-3")
+
+
+def test_unclosed_tag_quote_is_reported_as_invalid_input():
+    with pytest.raises(InvalidUrlError, match="кавычк"):
+        parse_submission_batch('https://example.com/image.jpg "unfinished')

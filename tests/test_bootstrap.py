@@ -4,6 +4,7 @@ from app.bootstrap import _sync_channels, bootstrap
 from app.config import Settings
 from app.db.models import Channel
 from app.db.session import create_database, create_schema
+from app.news.http import PublicOnlyResolver
 
 
 async def test_application_bootstraps_without_network():
@@ -16,6 +17,7 @@ async def test_application_bootstraps_without_network():
     )
     application = await bootstrap(settings)
     assert application.dispatcher.resolve_used_update_types()
+    assert isinstance(application.http.connector._resolver, PublicOnlyResolver)
     await application.http.close()
     await application.bot.session.close()
     await application.engine.dispose()

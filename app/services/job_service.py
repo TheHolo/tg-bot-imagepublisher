@@ -38,6 +38,7 @@ def serialize_post(post: SourcePost) -> dict:
         "title": post.title,
         "description": post.description,
         "body": post.body,
+        "content_warning": post.content_warning,
         "author_id": post.author_id,
         "author_name": post.author_name,
         "author_url": post.author_url,

@@ -238,9 +238,9 @@ def _completion_source(source: ExtractedNewsSource) -> ExtractedNewsSource:
     )
 
 
-async def _wait_or_stop(stop: asyncio.Event, timeout: float) -> None:
+async def _wait_or_stop(stop: asyncio.Event, timeout_seconds: float) -> None:
     try:
-        await asyncio.wait_for(stop.wait(), timeout=timeout)
+        await asyncio.wait_for(stop.wait(), timeout=timeout_seconds)
     except TimeoutError:
         pass
 

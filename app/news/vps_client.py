@@ -165,8 +165,9 @@ class VpsNewsApiClient:
                     response.release()
 
             if attempt >= self.max_retries:
-                assert last_error is not None
+                if last_error is None:
+                    raise VpsApiError("VPS API request failed without an error response")
                 raise last_error
             await asyncio.sleep(self.retry_backoff_seconds * (2**attempt))
 
-        raise AssertionError("unreachable")
+        raise RuntimeError("unreachable VPS API retry state")

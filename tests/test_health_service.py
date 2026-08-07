@@ -7,7 +7,12 @@ from app.db.models import Channel, Job, Publication, User, utcnow
 from app.db.session import create_database, create_schema
 from app.domain.enums import JobStatus
 from app.queue.worker import WorkerSnapshot
-from app.services.health_service import HealthLevel, HealthService, format_size, render_health_report
+from app.services.health_service import (
+    HealthLevel,
+    HealthService,
+    format_size,
+    render_health_report,
+)
 
 
 class FakeWorkers:

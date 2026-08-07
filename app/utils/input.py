@@ -93,19 +93,22 @@ def parse_submission_batch(text: str, max_urls: int = 10) -> tuple[list[str], li
     urls = list(dict.fromkeys(urls))
     if len(urls) > max_urls:
         raise InvalidUrlError(f"За одно сообщение можно отправить не более {max_urls} ссылок")
-    tokens = shlex.split(remaining_text)
+    try:
+        tokens = shlex.split(remaining_text)
+    except ValueError as error:
+        raise InvalidUrlError("Незакрытая кавычка в тегах или параметрах") from error
     tags: list[str] = []
     channel: str | None = None
     index = 0
     while index < len(tokens):
-        token = tokens[index]
-        if token == "--channel":
+        argument = tokens[index]
+        if argument == "--channel":
             if index + 1 >= len(tokens):
                 raise InvalidUrlError("После --channel нужен alias канала")
             channel = tokens[index + 1].strip().lower()
             index += 2
             continue
-        tags.append(token)
+        tags.append(argument)
         index += 1
     return urls, tags, channel
 

@@ -4,7 +4,12 @@ from pathlib import Path
 
 import aiohttp
 
-from app.domain.exceptions import DownloadError, MediaTooLargeError, MediaValidationError
+from app.domain.exceptions import (
+    ApplicationError,
+    DownloadError,
+    MediaTooLargeError,
+    MediaValidationError,
+)
 from app.domain.models import DownloadedMedia, MediaItem
 from app.utils.urls import ensure_public_dns
 
@@ -18,7 +23,6 @@ class DownloadService:
         self.max_size = max_size
 
     async def download(self, job_id: int | str, item: MediaItem) -> DownloadedMedia:
-        await ensure_public_dns(item.url)
         directory = (self.storage / "jobs" / str(job_id)).resolve()
         if self.storage not in directory.parents:
             raise DownloadError("Небезопасный путь хранения")
@@ -28,6 +32,7 @@ class DownloadService:
         temporary = target.with_suffix(target.suffix + ".part")
         size = 0
         try:
+            await ensure_public_dns(item.url)
             async with self.session.get(item.url, headers=item.headers, allow_redirects=False) as response:
                 if response.status in {301, 302, 303, 307, 308}:
                     raise DownloadError("Небезопасное перенаправление при загрузке")
@@ -36,7 +41,7 @@ class DownloadService:
                 mime = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
                 if not mime.startswith("image/"):
                     raise MediaValidationError("Полученный файл не является изображением")
-                declared = int(response.headers.get("Content-Length", 0))
+                declared = _content_length(response.headers.get("Content-Length"))
                 if declared > self.max_size:
                     raise MediaTooLargeError("Файл превышает лимит")
                 with temporary.open("wb") as stream:
@@ -47,6 +52,16 @@ class DownloadService:
                         stream.write(chunk)
             os.replace(temporary, target)
             return DownloadedMedia(item, target, mime, size)
-        except Exception:
-            temporary.unlink(missing_ok=True)
+        except ApplicationError:
             raise
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise DownloadError("Не удалось загрузить файл") from error
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _content_length(value: str | None) -> int:
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0

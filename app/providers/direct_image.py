@@ -1,9 +1,14 @@
 import hashlib
 import mimetypes
 from pathlib import PurePosixPath
+from typing import ClassVar
 from urllib.parse import unquote, urlsplit
 
-from app.domain.exceptions import InvalidUrlError, MediaTooLargeError, SourceNotFoundError
+from app.domain.exceptions import (
+    InvalidUrlError,
+    MediaTooLargeError,
+    SourceNotFoundError,
+)
 from app.domain.models import MediaItem, SourcePost
 from app.providers.base import BaseProvider
 from app.utils.urls import ensure_public_dns, validate_public_url
@@ -11,7 +16,9 @@ from app.utils.urls import ensure_public_dns, validate_public_url
 
 class DirectImageProvider(BaseProvider):
     name = "direct"
-    extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    extensions: ClassVar[frozenset[str]] = frozenset(
+        {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    )
 
     def __init__(self, session, max_size: int) -> None:
         super().__init__(session)
@@ -42,7 +49,10 @@ class DirectImageProvider(BaseProvider):
             if response.status not in {200, 206}:
                 raise InvalidUrlError(f"Сервер изображения ответил HTTP {response.status}")
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-            size = int(response.headers.get("Content-Length", 0))
+            size = _response_size(
+                response.headers.get("Content-Length"),
+                response.headers.get("Content-Range"),
+            )
         if not content_type.startswith("image/"):
             raise InvalidUrlError("Ссылка ведёт не на изображение")
         if size > self.max_size:
@@ -62,3 +72,17 @@ class DirectImageProvider(BaseProvider):
             author_url=f"{parsed.scheme}://{parsed.hostname}",
             media_items=[MediaItem(url=normalized, filename=filename, order=0, mime_type=content_type, size=size)],
         )
+
+
+def _response_size(content_length: str | None, content_range: str | None) -> int:
+    if content_range:
+        _, separator, total = content_range.rpartition("/")
+        if separator and total != "*":
+            try:
+                return max(0, int(total))
+            except ValueError:
+                pass
+    try:
+        return max(0, int(content_length or 0))
+    except ValueError:
+        return 0

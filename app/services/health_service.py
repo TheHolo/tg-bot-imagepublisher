@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from html import escape
 from pathlib import Path
@@ -167,7 +167,7 @@ class HealthService:
                     .where(Job.status == JobStatus.QUEUED)
                 )
             ).one()
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            cutoff = datetime.now(UTC) - timedelta(hours=24)
             failures_24h, uncertain_24h = (
                 await session.execute(
                     select(
@@ -177,7 +177,7 @@ class HealthService:
                     .where(Job.status == JobStatus.FAILED, Job.updated_at >= cutoff)
                 )
             ).one()
-            stalled_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+            stalled_cutoff = datetime.now(UTC) - timedelta(minutes=15)
             stalled_count = await session.scalar(
                 select(func.count(Job.id)).where(
                     Job.status.in_({JobStatus.DOWNLOADING, JobStatus.PROCESSING, JobStatus.PUBLISHING}),
@@ -391,7 +391,7 @@ class HealthService:
             return can_post, (
                 f"{channel.alias} · {'can post' if can_post else 'нет права публикации'} · {latency} мс"
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - report any Telegram probe failure
             return False, f"{channel.alias} · ошибка прав · {type(error).__name__}"
 
     async def _storage_line(self, *, full: bool) -> HealthLine:
@@ -446,7 +446,7 @@ class HealthService:
             status = await asyncio.wait_for(provider.healthcheck(), timeout=5)
             latency = round((time.perf_counter() - started) * 1000)
             return True, f"{provider.name} · HTTP {status} · {latency} мс"
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - provider probes must stay isolated
             return False, f"{provider.name} · недоступен · {type(error).__name__}"
 
 
@@ -475,8 +475,8 @@ def age_seconds(value: datetime | None) -> float | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return max(0.0, (datetime.now(timezone.utc) - value).total_seconds())
+        value = value.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - value).total_seconds())
 
 
 def format_age(value: datetime | None) -> str:

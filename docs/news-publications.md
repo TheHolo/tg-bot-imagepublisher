@@ -59,15 +59,91 @@ Worker передаёт модели недоверенный текст и от
 
 На VPS возвращаются черновик, метаданные и SHA-256-подтверждение обработанного текста. Полная длинная статья или расшифровка не копируется обратно.
 
-## Настройка VPS
+## Настройка домашнего компьютера
 
-В `.env`:
+Склонируйте проект на домашний компьютер, откройте терминал в корневой папке
+проекта — там, где находятся `pyproject.toml`, `.env.example` и
+`bot-settings.toml`, — затем установите зависимости и модель:
 
-```env
-NEWS_WORKER_TOKEN=replace_with_a_long_random_secret
+```bash
+python -m pip install -e '.[news-worker]'
+ollama pull gemma4:12b
 ```
 
-В `bot-settings.toml`:
+Под «домашним `.env`» имеется в виду файл `.env` именно в этой папке проекта
+на домашнем компьютере. Это не `.env` на VPS и не системный файл Windows или
+Linux. Если файла ещё нет, создайте его копированием примера:
+
+Linux/macOS:
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Откройте созданный `.env` в любом текстовом редакторе и заполните параметры
+домашнего worker:
+
+```env
+HOME_WORKER_TOKEN=replace_with_a_long_random_secret
+HOME_WORKER_VPS_API_URL=http://127.0.0.1:8091
+HOME_WORKER_OLLAMA_BASE_URL=http://127.0.0.1:11434
+HOME_WORKER_OLLAMA_MODEL=gemma4:12b
+```
+
+`HOME_WORKER_TOKEN` — общий секрет, которым домашний worker подтверждает своё
+право получать задачи от VPS и возвращать результаты. Формат токена специально
+не ограничен, но он должен быть непустым, случайным и трудным для подбора.
+Рекомендуется не меньше 32 случайных байт. Например, безопасное значение можно
+сгенерировать так:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Сохраните полученную строку: на следующем шаге её нужно посимвольно скопировать
+на VPS. Имена переменных на двух машинах различаются, но значения одинаковы:
+
+```env
+# Домашний компьютер: .env
+HOME_WORKER_TOKEN=SeCrEtWoRdFoRlLm
+
+# VPS: .env
+NEWS_WORKER_TOKEN=SeCrEtWoRdFoRlLm
+```
+
+`SeCrEtWoRdFoRlLm` здесь только наглядный пример — не используйте его как
+настоящий секрет. Не добавляйте `.env` в Git и не отправляйте токен в сообщения.
+
+Секцию `[home_worker]` в расположенном рядом `bot-settings.toml` нужно менять
+только для нестандартных лимитов, размера контекста или интервалов. Секрет в
+TOML переносить нельзя.
+
+Запуск:
+
+```bash
+news-home-worker
+```
+
+Команду запускайте из корневой папки проекта, чтобы worker нашёл домашние
+`.env` и `bot-settings.toml`.
+
+## Настройка VPS
+
+На VPS откройте `.env` в корневой папке установленного проекта и добавьте
+`NEWS_WORKER_TOKEN`. Его значение должно в точности совпадать со значением
+`HOME_WORKER_TOKEN` на домашнем компьютере:
+
+```env
+NEWS_WORKER_TOKEN=replace_with_the_same_long_random_secret
+```
+
+В `bot-settings.toml` на VPS проверьте настройки API:
 
 ```toml
 [bot]
@@ -78,32 +154,6 @@ news_model_name = "gemma4:12b"
 ```
 
 Пустой `NEWS_WORKER_TOKEN` полностью отключает news API и создание новостей.
-
-## Настройка домашнего компьютера
-
-Установите зависимости и модель:
-
-```bash
-python -m pip install -e '.[news-worker]'
-ollama pull gemma4:12b
-```
-
-В домашнем `.env`:
-
-```env
-HOME_WORKER_TOKEN=the_same_secret_as_on_vps
-HOME_WORKER_VPS_API_URL=http://127.0.0.1:8091
-HOME_WORKER_OLLAMA_BASE_URL=http://127.0.0.1:11434
-HOME_WORKER_OLLAMA_MODEL=gemma4:12b
-```
-
-Включите секцию `[home_worker]` в `bot-settings.toml`, если нужны нестандартные лимиты, контекст или интервалы.
-
-Запуск:
-
-```bash
-news-home-worker
-```
 
 ## Защищённое соединение
 

@@ -8,8 +8,8 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import ColumnElement
 
 from app.db.models import Channel, Job, JobEvent, Publication, User, utcnow
-from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
-from app.domain.models import SourcePost
+from app.domain.enums import ACTIVE_JOB_STATUSES, ContentKind, JobStatus
+from app.domain.models import MediaItem, SourcePost
 
 QUEUE_FILTER_STATUSES = {
     "active": ACTIVE_JOB_STATUSES,
@@ -30,33 +30,38 @@ class BulkRetryResult:
 
 def serialize_post(post: SourcePost) -> dict:
     return {
+        "content_kind": post.content_kind.value,
         "provider": post.provider,
         "source_id": post.source_id,
         "source_url": post.source_url,
         "normalized_url": post.normalized_url,
         "title": post.title,
         "description": post.description,
+        "body": post.body,
         "author_id": post.author_id,
         "author_name": post.author_name,
         "author_url": post.author_url,
         "source_tags": post.source_tags,
         "published_at": post.published_at.isoformat() if post.published_at else None,
-        "media_items": [
-            {
-                "url": item.url,
-                "preview_url": item.preview_url,
-                "filename": item.filename,
-                "mime_type": item.mime_type,
-                "media_type": item.media_type.value,
-                "width": item.width,
-                "height": item.height,
-                "size": item.size,
-                "order": item.order,
-                "headers": item.headers,
-            }
-            for item in post.media_items
-        ],
+        "media_items": [_serialize_media_item(item) for item in post.media_items],
         "metadata": post.metadata,
+    }
+
+
+def _serialize_media_item(item: MediaItem) -> dict:
+    return {
+        "url": item.url,
+        "preview_url": item.preview_url,
+        "filename": item.filename,
+        "mime_type": item.mime_type,
+        "media_type": item.media_type.value,
+        "width": item.width,
+        "height": item.height,
+        "size": item.size,
+        "telegram_file_id": item.telegram_file_id,
+        "telegram_file_unique_id": item.telegram_file_unique_id,
+        "order": item.order,
+        "headers": item.headers,
     }
 
 
@@ -162,6 +167,7 @@ class JobService:
             job = Job(
                 created_by_user_id=user_id,
                 provider=post.provider,
+                content_kind=post.content_kind,
                 source_id=post.source_id,
                 source_url=post.source_url,
                 normalized_url=post.normalized_url,
@@ -187,11 +193,16 @@ class JobService:
                 JobStatus.WAITING_CONFIRMATION, JobStatus.QUEUED, JobStatus.SCHEDULED,
             }:
                 return None
+            if (
+                job.content_kind == ContentKind.NEWS
+                and job.status != JobStatus.WAITING_CONFIRMATION
+            ):
+                return None
             job.caption_override = caption
             return job
 
     async def set_post_field(self, job_id: int, field: str, value: str) -> Job | None:
-        if field not in {"title", "description"}:
+        if field not in {"title", "description", "body"}:
             raise ValueError(f"Unsupported post field: {field}")
         async with self.sessions() as session, session.begin():
             job = await session.get(Job, job_id)
@@ -205,6 +216,57 @@ class JobService:
                 post_data["metadata"] = metadata
             job.post_data = post_data
             return job
+
+    async def add_media(
+        self, job_id: int, item: MediaItem, *, replace: bool = False, limit: int = 10,
+    ) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not self._can_edit_news(job):
+                return None
+            post_data = dict(job.post_data)
+            current = [] if replace else [dict(row) for row in post_data.get("media_items", [])]
+            if len(current) >= limit:
+                raise ValueError(f"Допустимо не более {limit} медиафайлов")
+            item.order = len(current)
+            current.append(_serialize_media_item(item))
+            post_data["media_items"] = current
+            job.post_data = post_data
+            return job
+
+    async def remove_media(self, job_id: int, index: int) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not self._can_edit_news(job):
+                return None
+            post_data = dict(job.post_data)
+            current = [dict(row) for row in post_data.get("media_items", [])]
+            if index < 0 or index >= len(current):
+                raise IndexError("Медиафайл не найден")
+            current.pop(index)
+            for order, row in enumerate(current):
+                row["order"] = order
+            post_data["media_items"] = current
+            job.post_data = post_data
+            return job
+
+    async def clear_media(self, job_id: int) -> Job | None:
+        async with self.sessions() as session, session.begin():
+            job = await session.get(Job, job_id)
+            if not self._can_edit_news(job):
+                return None
+            post_data = dict(job.post_data)
+            post_data["media_items"] = []
+            job.post_data = post_data
+            return job
+
+    @staticmethod
+    def _can_edit_news(job: Job | None) -> bool:
+        return bool(
+            job
+            and job.content_kind == ContentKind.NEWS
+            and job.status == JobStatus.WAITING_CONFIRMATION
+        )
 
     async def get(self, job_id: int) -> Job | None:
         async with self.sessions() as session:

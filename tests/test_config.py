@@ -43,12 +43,10 @@ def test_repository_settings_reject_secrets(tmp_path):
 def test_env_file_accepts_single_quoted_channel_json(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "\n".join([
-            "BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI",
-            "ADMIN_IDS=123456789",
-            "DEFAULT_CHANNEL_ALIAS=artwork",
-            'CHANNELS_JSON=\'{"artwork":{"chat_id":"-1001234567890","publish_mode":"auto"}}\'',
-        ]),
+        "BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI\n"
+        "ADMIN_IDS=123456789\n"
+        "DEFAULT_CHANNEL_ALIAS=artwork\n"
+        'CHANNELS_JSON=\'{"artwork":{"chat_id":"-1001234567890","publish_mode":"auto"}}\'',
         encoding="utf-8",
     )
     for name in ("BOT_TOKEN", "ADMIN_IDS", "DEFAULT_CHANNEL_ALIAS", "CHANNELS_JSON"):
@@ -58,3 +56,25 @@ def test_env_file_accepts_single_quoted_channel_json(tmp_path, monkeypatch):
 
     assert settings.default_channel_alias == "artwork"
     assert settings.channels_json["artwork"]["chat_id"] == "-1001234567890"
+
+
+def test_news_api_is_opt_in_and_uses_gemma4_12b_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("NEWS_WORKER_TOKEN", raising=False)
+    settings = Settings(
+        _config_file=tmp_path / "missing.toml",
+        _env_file=None,
+        bot_token="123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI",
+    )
+    assert settings.news_api_enabled is False
+    assert settings.news_model_name == "gemma4:12b"
+    assert settings.news_api_host == "127.0.0.1"
+
+    enabled = Settings(
+        _config_file=tmp_path / "missing.toml",
+        _env_file=None,
+        bot_token="123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI",
+        news_worker_token="shared-secret",
+        news_api_bind_host="0.0.0.0",
+    )
+    assert enabled.news_api_enabled is True
+    assert enabled.news_api_bind_host == "0.0.0.0"

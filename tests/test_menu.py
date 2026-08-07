@@ -24,6 +24,7 @@ from app.bot.menu import (
     COMMAND_CATALOG,
     HEALTH_BUTTON,
     HELP_BUTTON,
+    NEWS_BUTTON,
     PREVIEW_BUTTON,
     QUEUE_BUTTON,
     STATS_BUTTON,
@@ -40,7 +41,9 @@ from app.bot.router import build_router
 from app.bot.states import CreatePublication, EditPreview
 from app.db.models import Channel
 from app.domain.enums import JobStatus
+from app.domain.exceptions import UnsupportedSourceError
 from app.domain.models import MediaItem, SourcePost
+from app.news.models import NewsSourceKind
 from app.services.health_service import HealthReport
 from app.services.job_service import serialize_post
 
@@ -106,7 +109,7 @@ def make_callback(bot: RecordingBot, message: Message, data: str) -> CallbackQue
 
 def make_router(
     jobs, *, health=None, channel_stats=None, ingest=None, previews=None,
-    translator=None,
+    translator=None, registry=None, news_submissions=None, news_tasks=None,
 ):
     health = health or SimpleNamespace(check=AsyncMock())
     empty_subscriber_stats = SimpleNamespace(
@@ -132,8 +135,10 @@ def make_router(
         health=health,
         channel_stats=channel_stats,
         wakeup=SimpleNamespace(set=Mock()),
-        registry=SimpleNamespace(names=("pixiv", "deviantart", "direct")),
+        registry=registry or SimpleNamespace(names=("pixiv", "deviantart", "direct")),
         settings=settings,
+        news_submissions=news_submissions,
+        news_tasks=news_tasks,
     )
 
 
@@ -168,7 +173,7 @@ def test_main_menu_has_requested_persistent_layout():
     markup = main_menu_keyboard()
 
     assert [[button.text for button in row] for row in markup.keyboard] == [
-        [ADD_BUTTON],
+        [ADD_BUTTON, NEWS_BUTTON],
         [QUEUE_BUTTON, PREVIEW_BUTTON],
         [STATS_BUTTON, CHANNELS_BUTTON],
         [HEALTH_BUTTON, HELP_BUTTON],
@@ -305,11 +310,14 @@ def test_menu_callback_data_stays_within_telegram_limit():
 
 
 def test_help_catalog_exactly_covers_router_slash_commands():
-    router_path = Path(__file__).parents[1] / "app" / "bot" / "router.py"
-    tree = ast.parse(router_path.read_text(encoding="utf-8"))
+    router_paths = [
+        Path(__file__).parents[1] / "app" / "bot" / "router.py",
+        Path(__file__).parents[1] / "app" / "bot" / "news_ui.py",
+    ]
     routed_commands = {
         argument.value
-        for node in ast.walk(tree)
+        for router_path in router_paths
+        for node in ast.walk(ast.parse(router_path.read_text(encoding="utf-8")))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "Command"
@@ -596,6 +604,45 @@ async def test_plain_url_starts_wizard_and_requests_channel():
         for row in answers[-1].reply_markup.inline_keyboard
         for button in row
     ] == ["wizard_channel:0:7", "wizard_cancel"]
+
+
+async def test_direct_news_url_is_queued_for_home_worker():
+    url = "https://example.com/news/story"
+    ingest = SimpleNamespace(parse=Mock(return_value=([url], ["важное"], None)))
+    registry = SimpleNamespace(
+        names=("pixiv", "deviantart", "direct"),
+        resolve=Mock(side_effect=UnsupportedSourceError("unsupported")),
+    )
+    queued = SimpleNamespace(
+        task=SimpleNamespace(id=91),
+        channel=SimpleNamespace(alias="news"),
+    )
+    submissions = SimpleNamespace(create=AsyncMock(return_value=queued))
+    tasks = SimpleNamespace(set_status_message=AsyncMock())
+    router = make_router(
+        SimpleNamespace(),
+        ingest=ingest,
+        registry=registry,
+        news_submissions=submissions,
+        news_tasks=tasks,
+    )
+
+    class NewsBot(RecordingBot):
+        async def __call__(self, method, request_timeout=None):
+            self.requests.append(method)
+            return SimpleNamespace(message_id=77)
+
+    bot = NewsBot()
+    message = make_message(bot, url)
+    state = make_state()
+
+    await handler(router, "message", "submission")(message, state)
+
+    request = submissions.create.await_args.kwargs["request"]
+    assert request.kind == NewsSourceKind.WEBSITE
+    assert request.value == url
+    assert submissions.create.await_args.kwargs["user_tags"] == ["важное"]
+    tasks.set_status_message.assert_awaited_once_with(91, 77)
 
 
 async def test_wizard_channel_selection_creates_editable_confirmation():

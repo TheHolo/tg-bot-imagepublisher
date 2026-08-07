@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.domain.enums import MediaType
+from app.domain.enums import ContentKind, MediaType
 
 
 @dataclass(slots=True)
@@ -17,6 +17,8 @@ class MediaItem:
     width: int | None = None
     height: int | None = None
     size: int | None = None
+    telegram_file_id: str | None = None
+    telegram_file_unique_id: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
 
 
@@ -30,6 +32,8 @@ class SourcePost:
     author_name: str
     author_url: str
     media_items: list[MediaItem]
+    content_kind: ContentKind = ContentKind.ARTWORK
+    body: str = ""
     description: str = ""
     author_id: str | None = None
     source_tags: list[str] = field(default_factory=list)
@@ -50,9 +54,11 @@ class DownloadedMedia:
 
 @dataclass(slots=True)
 class PreparedMedia:
-    path: Path
+    path: Path | None
     as_document: bool
     order: int
+    media_type: MediaType = MediaType.IMAGE
+    telegram_file_id: str | None = None
 
 
 @dataclass(slots=True)

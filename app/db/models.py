@@ -14,7 +14,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from app.domain.enums import JobStatus
+from app.domain.enums import ContentKind, JobStatus, NewsTaskStatus
 
 
 def utcnow() -> datetime:
@@ -82,6 +82,9 @@ class Job(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     provider: Mapped[str] = mapped_column(String(64))
+    content_kind: Mapped[str] = mapped_column(
+        String(32), default=ContentKind.ARTWORK, index=True,
+    )
     source_id: Mapped[str] = mapped_column(String(255), index=True)
     source_url: Mapped[str] = mapped_column(Text)
     normalized_url: Mapped[str] = mapped_column(Text)
@@ -107,6 +110,43 @@ class Job(Base):
     force_publish: Mapped[bool] = mapped_column(Boolean, default=False)
     channel: Mapped[Channel] = relationship()
     media_items: Mapped[list["MediaRecord"]] = relationship(cascade="all, delete-orphan")
+
+
+class NewsTask(Base):
+    __tablename__ = "news_tasks"
+    __table_args__ = (
+        Index("ix_news_tasks_claim", "status", "lease_expires_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    target_channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"), index=True)
+    origin_chat_id: Mapped[str] = mapped_column(String(64))
+    status_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_kind: Mapped[str] = mapped_column(String(32), index=True)
+    input_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    user_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(
+        String(32), default=NewsTaskStatus.QUEUED, index=True,
+    )
+    stage: Mapped[str] = mapped_column(String(64), default="queued")
+    stage_message: Mapped[str | None] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(128))
+    lease_owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    channel: Mapped[Channel] = relationship()
+    job: Mapped[Job | None] = relationship()
 
 
 class MediaRecord(Base):

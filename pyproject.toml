@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "telegram-image-publisher"
 version = "0.1.0"
-description = "Private Telegram bot that publishes artwork from external sources"
+description = "Private Telegram bot that prepares and publishes artwork and locally rewritten news"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,7 +21,16 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29,<1"]
 proxy = ["aiohttp-socks>=0.9,<1"]
+news-worker = [
+  "trafilatura>=2.0,<3",
+  "extruct>=0.18,<1",
+  "yt-dlp>=2025.6",
+  "youtube-transcript-api>=1.2,<2",
+]
 dev = ["pytest>=8.3,<9", "pytest-asyncio>=1.0,<2"]
+
+[project.scripts]
+news-home-worker = "app.home_worker:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

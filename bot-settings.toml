@@ -19,3 +19,17 @@ pixiv_max_images = 10
 delete_files_after_publish = true
 files_ttl_hours = 24
 timezone = "Asia/Vladivostok"
+news_api_host = "127.0.0.1"
+news_api_port = 8091
+news_task_lease_seconds = 1800
+news_model_name = "gemma4:12b"
+
+# Copy and uncomment this section on the home computer. Keep its token in .env.
+# [home_worker]
+# vps_api_url = "http://127.0.0.1:8091"
+# ollama_base_url = "http://127.0.0.1:11434"
+# ollama_model = "gemma4:12b"
+# poll_interval_seconds = 5
+# lease_seconds = 1800
+# ollama_context_length = 8192
+# temperature = 0.1

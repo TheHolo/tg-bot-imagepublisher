@@ -4,15 +4,18 @@ from dataclasses import dataclass
 import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from sqlalchemy import select
 
 from app.bot.menu import configure_bot_ui
 from app.bot.middleware import AdminOnlyMiddleware
+from app.bot.news_notifications import NewsTaskNotifier
+from app.bot.news_ui import build_news_router
 from app.bot.router import build_router
 from app.config import Settings
 from app.db.models import Channel
 from app.db.session import create_database, create_schema
+from app.news.api import NewsApiServer
 from app.providers.deviantart import DeviantArtProvider
 from app.providers.direct_image import DirectImageProvider
 from app.providers.pixiv import PixivProvider
@@ -25,6 +28,9 @@ from app.services.health_service import HealthService
 from app.services.ingest_service import IngestService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
+from app.services.news_render_service import NewsRenderService
+from app.services.news_submission_service import NewsSubmissionService
+from app.services.news_task_service import NewsTaskService
 from app.services.preview_service import PreviewService
 from app.services.publisher_service import TelegramPublisher
 from app.services.translation_service import TranslationService
@@ -39,14 +45,19 @@ class Application:
     engine: object
     workers: WorkerPool
     channel_stats: ChannelStatsService
+    news_api: NewsApiServer | None = None
 
     async def run(self) -> None:
         try:
             await configure_bot_ui(self.bot)
             await self.workers.start()
             await self.channel_stats.start()
+            if self.news_api is not None:
+                await self.news_api.start()
             await self.dispatcher.start_polling(self.bot, allowed_updates=self.dispatcher.resolve_used_update_types())
         finally:
+            if self.news_api is not None:
+                await self.news_api.stop()
             await self.channel_stats.stop()
             await self.workers.stop()
             await self.http.close()
@@ -91,6 +102,7 @@ async def bootstrap(settings: Settings | None = None) -> Application:
     downloader = DownloadService(http, settings.storage_path, settings.max_download_bytes)
     media = MediaService()
     captions = CaptionService()
+    news_renderer = NewsRenderService()
     publisher = TelegramPublisher(bot)
     translator = TranslationService(
         http, enabled=settings.auto_translate_titles, timeout=settings.translation_timeout
@@ -99,6 +111,7 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         downloader=downloader, media=media, captions=captions, publisher=publisher,
         storage=settings.storage_path, auto_add_source_tags=settings.auto_add_source_tags,
         max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
+        news_renderer=news_renderer,
     )
     wakeup = asyncio.Event()
     workers = WorkerPool(
@@ -108,6 +121,7 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         delete_after_publish=settings.delete_files_after_publish, storage=settings.storage_path,
         auto_add_source_tags=settings.auto_add_source_tags,
         max_tags=settings.max_tags, max_tag_length=settings.max_tag_length, translator=translator,
+        news_renderer=news_renderer,
     )
     health = HealthService(
         bot=bot, sessions=sessions, workers=workers, storage=settings.storage_path,
@@ -117,16 +131,55 @@ async def bootstrap(settings: Settings | None = None) -> Application:
         bot=bot, sessions=sessions, admin_ids=settings.admin_ids,
         timezone_name=settings.timezone,
     )
-    dispatcher = Dispatcher(storage=MemoryStorage())
+    news_tasks = NewsTaskService(
+        sessions,
+        lease_extension_seconds=settings.news_task_lease_seconds,
+        news_renderer=news_renderer,
+        auto_add_source_tags=settings.auto_add_source_tags,
+        max_tags=settings.max_tags,
+        max_tag_length=settings.max_tag_length,
+    )
+    news_submissions = NewsSubmissionService(
+        jobs=jobs,
+        tasks=news_tasks,
+        default_channel_alias=settings.default_channel_alias,
+        model_name=settings.news_model_name,
+        max_attempts=settings.max_job_attempts,
+        enabled=settings.news_api_enabled,
+    )
+    news_notifier = NewsTaskNotifier(bot=bot, jobs=jobs, previews=previews)
+    news_api = (
+        NewsApiServer(
+            tasks=news_tasks,
+            token=settings.news_worker_token or "",
+            host=settings.news_api_bind_host or settings.news_api_host,
+            port=settings.news_api_port,
+            default_lease_seconds=settings.news_task_lease_seconds,
+            on_progress=news_notifier.progress,
+            on_complete=news_notifier.complete,
+            on_failure=news_notifier.failure,
+        )
+        if settings.news_api_enabled else None
+    )
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     middleware = AdminOnlyMiddleware(settings.admin_ids)
+    news_router = build_news_router(
+        submissions=news_submissions, tasks=news_tasks, jobs=jobs, previews=previews,
+    )
     router = build_router(
         ingest, jobs, previews, translator, health, channel_stats,
         wakeup, registry, settings,
+        news_submissions=news_submissions, news_tasks=news_tasks,
     )
+    news_router.message.outer_middleware(middleware)
+    news_router.callback_query.outer_middleware(middleware)
     router.message.outer_middleware(middleware)
     router.callback_query.outer_middleware(middleware)
+    dispatcher.include_router(news_router)
     dispatcher.include_router(router)
-    return Application(settings, bot, dispatcher, http, engine, workers, channel_stats)
+    return Application(
+        settings, bot, dispatcher, http, engine, workers, channel_stats, news_api,
+    )
 
 
 async def _sync_channels(sessions, settings: Settings) -> None:

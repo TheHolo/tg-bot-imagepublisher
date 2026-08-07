@@ -25,6 +25,10 @@ REPOSITORY_SETTING_FIELDS = {
     "delete_files_after_publish",
     "files_ttl_hours",
     "timezone",
+    "news_api_host",
+    "news_api_port",
+    "news_task_lease_seconds",
+    "news_model_name",
 }
 
 
@@ -56,6 +60,16 @@ class Settings(BaseSettings):
     delete_files_after_publish: bool = True
     files_ttl_hours: int = 24
     timezone: str = "UTC"
+    news_worker_token: str | None = None
+    news_api_bind_host: str | None = None
+    news_api_host: str = "127.0.0.1"
+    news_api_port: int = Field(8091, ge=1, le=65535)
+    news_task_lease_seconds: int = Field(1800, ge=60, le=21600)
+    news_model_name: str = "gemma4:12b"
+
+    @property
+    def news_api_enabled(self) -> bool:
+        return bool(self.news_worker_token)
 
     def __init__(self, _config_file: str | Path = "bot-settings.toml", **values: Any) -> None:
         repository_values: dict[str, Any] = {}

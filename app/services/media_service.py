@@ -27,21 +27,33 @@ class MediaService:
         media.width, media.height = width, height
         if mode == "document":
             self._validate_document_size(media.size)
-            return PreparedMedia(media.path, as_document=True, order=media.source.order)
+            return PreparedMedia(
+                media.path, as_document=True, order=media.source.order,
+                media_type=media.source.media_type,
+            )
 
         aspect_ratio = max(width / height, height / width)
         photo_compatible = fmt in PHOTO_FORMATS and aspect_ratio <= PHOTO_MAX_ASPECT_RATIO
         within_limits = media.size <= PHOTO_MAX_BYTES and width + height <= PHOTO_MAX_DIMENSION_SUM
         if photo_compatible and within_limits:
-            return PreparedMedia(media.path, as_document=False, order=media.source.order)
+            return PreparedMedia(
+                media.path, as_document=False, order=media.source.order,
+                media_type=media.source.media_type,
+            )
 
         if photo_compatible:
             prepared_path = await asyncio.to_thread(self._fit_for_telegram_photo, media.path)
             if prepared_path is not None:
-                return PreparedMedia(prepared_path, as_document=False, order=media.source.order)
+                return PreparedMedia(
+                    prepared_path, as_document=False, order=media.source.order,
+                    media_type=media.source.media_type,
+                )
 
         self._validate_document_size(media.size)
-        return PreparedMedia(media.path, as_document=True, order=media.source.order)
+        return PreparedMedia(
+            media.path, as_document=True, order=media.source.order,
+            media_type=media.source.media_type,
+        )
 
     @staticmethod
     def _validate_document_size(size: int) -> None:

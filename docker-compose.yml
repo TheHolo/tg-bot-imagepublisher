@@ -2,6 +2,10 @@ services:
   bot:
     build: .
     env_file: .env
+    environment:
+      NEWS_API_BIND_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8091:8091"
     restart: unless-stopped
     volumes:
       - bot-data:/app/data

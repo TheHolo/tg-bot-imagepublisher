@@ -14,6 +14,16 @@ class CreatePublication(StatesGroup):
     waiting_for_channel = State()
 
 
+class CreateNews(StatesGroup):
+    waiting_for_source = State()
+    waiting_for_manual_text = State()
+
+
+class EditNews(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_media = State()
+
+
 class ManageChannel(StatesGroup):
     waiting_for_interval = State()
 

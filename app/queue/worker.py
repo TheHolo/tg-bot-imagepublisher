@@ -10,12 +10,14 @@ from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import Channel, Job, MediaRecord, Publication
-from app.domain.enums import JobStatus
+from app.domain.enums import ContentKind, JobStatus, MediaType
 from app.domain.exceptions import ApplicationError, DuplicatePublicationError
+from app.domain.models import PreparedMedia
 from app.services.caption_service import CaptionService
 from app.services.download_service import DownloadService
 from app.services.job_service import JobService
 from app.services.media_service import MediaService
+from app.services.news_render_service import NewsRenderService
 from app.services.preview_service import deserialize_post
 from app.services.publisher_service import TelegramPublisher
 from app.services.translation_service import TranslationService
@@ -64,10 +66,12 @@ class WorkerPool:
         publisher: TelegramPublisher, count: int, wakeup: asyncio.Event,
         delete_after_publish: bool, storage: Path, auto_add_source_tags: bool,
         max_tags: int, max_tag_length: int, translator: TranslationService,
+        news_renderer: NewsRenderService | None = None,
     ) -> None:
         self.bot, self.sessions, self.jobs = bot, sessions, jobs
         self.downloader, self.media, self.captions, self.publisher = downloader, media, captions, publisher
         self.translator = translator
+        self.news_renderer = news_renderer or NewsRenderService()
         self.count, self.wakeup = count, wakeup
         self.delete_after_publish, self.storage = delete_after_publish, storage
         self.auto_add_source_tags = auto_add_source_tags
@@ -129,35 +133,54 @@ class WorkerPool:
     async def _process(self, job: Job) -> None:
         self._set_job_stage(job.id, JobStatus.RESOLVING)
         post = deserialize_post(job.post_data)
-        await self.translator.enrich_title(post)
+        if post.content_kind == ContentKind.ARTWORK:
+            await self.translator.enrich_title(post)
         duplicate = await self.jobs.duplicate(job)
         if duplicate and not job.allow_duplicate:
             raise DuplicatePublicationError(f"Эта публикация уже отправлена в канал {job.channel.alias}")
-        downloaded = []
+        downloaded_by_order = {}
+        prepared: list[PreparedMedia] = []
         total_media = len(post.media_items)
         for position, item in enumerate(post.media_items, start=1):
             self._set_job_stage(job.id, f"{JobStatus.DOWNLOADING} {position}/{total_media}")
             if await self.jobs.is_cancelled(job.id):
                 await self.jobs.transition(job.id, JobStatus.CANCELLED)
                 return
-            downloaded.append(await self.downloader.download(job.id, item))
+            if item.telegram_file_id:
+                prepared.append(PreparedMedia(
+                    path=None,
+                    as_document=item.media_type == MediaType.DOCUMENT,
+                    order=item.order,
+                    media_type=item.media_type,
+                    telegram_file_id=item.telegram_file_id,
+                ))
+            else:
+                downloaded_by_order[item.order] = await self.downloader.download(job.id, item)
         await self.jobs.transition(job.id, JobStatus.PROCESSING)
-        prepared = []
-        for position, downloaded_item in enumerate(downloaded, start=1):
+        for position, downloaded_item in enumerate(downloaded_by_order.values(), start=1):
             self._set_job_stage(job.id, f"{JobStatus.PROCESSING} {position}/{total_media}")
             prepared.append(await self.media.prepare(downloaded_item, job.channel.publish_mode))
+        prepared.sort(key=lambda item: item.order)
         if await self.jobs.is_cancelled(job.id):
             await self.jobs.transition(job.id, JobStatus.CANCELLED)
             return
         caption_override = getattr(job, "caption_override", None)
+        caption_tags = job.user_tags
+        if self.auto_add_source_tags:
+            caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
         if caption_override is not None:
-            caption = self.captions.build_custom(caption_override)
+            caption = (
+                self.news_renderer.build_custom(caption_override, post, caption_tags)
+                if post.content_kind == ContentKind.NEWS
+                else self.captions.build_custom(caption_override)
+            )
         else:
-            caption_tags = job.user_tags
-            if self.auto_add_source_tags:
-                caption_tags = merge_tags(job.user_tags, job.source_tags, self.max_tags, self.max_tag_length)
-            caption = self.captions.build(
-                post, caption_tags, job.channel.caption_template or self.captions_template,
+            caption = (
+                self.news_renderer.build(post, caption_tags)
+                if post.content_kind == ContentKind.NEWS
+                else self.captions.build(
+                    post, caption_tags, job.channel.caption_template or self.captions_template,
+                )
             )
         await self.jobs.transition(job.id, JobStatus.PUBLISHING)
         self._set_job_stage(job.id, JobStatus.PUBLISHING)
@@ -170,14 +193,22 @@ class WorkerPool:
             channel = await session.get(Channel, job.target_channel_id)
             if channel:
                 update_channel_schedule_after_publication(channel, job, result.published_at)
-            for source, downloaded_item, prepared_item, message_id in zip(
-                post.media_items, downloaded, prepared, result.message_ids, strict=False
+            for source, prepared_item, message_id in zip(
+                post.media_items, prepared, result.message_ids, strict=False
             ):
+                downloaded_item = downloaded_by_order.get(source.order)
                 session.add(MediaRecord(
-                    job_id=job.id, source_url=source.url, local_path=str(downloaded_item.path),
-                    prepared_path=str(prepared_item.path), filename=source.filename, mime_type=downloaded_item.mime_type,
-                    media_type=source.media_type, size=downloaded_item.size, width=downloaded_item.width,
-                    height=downloaded_item.height, sort_order=source.order, download_status="completed",
+                    job_id=job.id, source_url=source.url,
+                    local_path=str(downloaded_item.path) if downloaded_item else None,
+                    prepared_path=str(prepared_item.path) if prepared_item.path else None,
+                    filename=source.filename,
+                    mime_type=downloaded_item.mime_type if downloaded_item else source.mime_type,
+                    media_type=source.media_type,
+                    size=downloaded_item.size if downloaded_item else source.size,
+                    width=downloaded_item.width if downloaded_item else source.width,
+                    height=downloaded_item.height if downloaded_item else source.height,
+                    sort_order=source.order,
+                    download_status="completed" if downloaded_item else "telegram",
                     publish_status="completed", telegram_message_id=message_id,
                 ))
         await self.jobs.transition(job.id, JobStatus.COMPLETED)

@@ -42,6 +42,11 @@ def _upgrade_schema(connection) -> None:
         connection.execute(text("ALTER TABLE channels ADD COLUMN is_paused BOOLEAN NOT NULL DEFAULT FALSE"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_channels_active_job_id ON channels (active_job_id)"))
     job_columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
+    if "content_kind" not in job_columns:
+        connection.execute(text(
+            "ALTER TABLE jobs ADD COLUMN content_kind VARCHAR(32) "
+            "NOT NULL DEFAULT 'artwork'"
+        ))
     if "force_publish" not in job_columns:
         connection.execute(text("ALTER TABLE jobs ADD COLUMN force_publish BOOLEAN NOT NULL DEFAULT FALSE"))
     if "caption_override" not in job_columns:
@@ -57,3 +62,4 @@ def _upgrade_schema(connection) -> None:
     ))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_queue_position ON jobs (queue_position)"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_scheduled_at ON jobs (scheduled_at)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_content_kind ON jobs (content_kind)"))

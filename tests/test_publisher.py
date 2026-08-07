@@ -3,11 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import InputMediaDocument, InputMediaPhoto
 
+from app.domain.enums import ContentKind, MediaType
 from app.domain.exceptions import PublishError, UncertainPublishError
-from app.domain.models import PreparedMedia
+from app.domain.models import PreparedMedia, SourcePost
 from app.services.publisher_service import TelegramPublisher
 
 
@@ -17,9 +18,27 @@ def prepared(index: int, *, as_document: bool = False) -> PreparedMedia:
 
 def bot_mock() -> SimpleNamespace:
     return SimpleNamespace(
+        send_animation=AsyncMock(),
         send_document=AsyncMock(),
+        send_message=AsyncMock(),
         send_photo=AsyncMock(),
         send_media_group=AsyncMock(),
+        send_video=AsyncMock(),
+    )
+
+
+def news_post() -> SourcePost:
+    return SourcePost(
+        provider="news-manual",
+        source_id="manual-1",
+        source_url="",
+        normalized_url="manual:1",
+        title="Новость",
+        body="Текст",
+        author_name="Ручной ввод",
+        author_url="",
+        media_items=[],
+        content_kind=ContentKind.NEWS,
     )
 
 
@@ -78,3 +97,49 @@ async def test_empty_publication_is_rejected_before_calling_telegram():
     bot.send_media_group.assert_not_awaited()
     bot.send_photo.assert_not_awaited()
     bot.send_document.assert_not_awaited()
+
+
+async def test_long_news_failure_after_media_is_marked_as_partial_publish():
+    bot = bot_mock()
+    bot.send_photo.return_value = SimpleNamespace(message_id=41)
+    bot.send_message.side_effect = TelegramBadRequest(
+        method=object(), message="message text is too long",
+    )
+
+    with pytest.raises(UncertainPublishError, match="частично"):
+        await TelegramPublisher(bot).preview(
+            -1001, [prepared(0)], "x" * 1025, news_post(),
+        )
+
+
+async def test_split_media_failure_after_first_item_is_marked_as_partial_publish():
+    bot = bot_mock()
+    bot.send_photo.return_value = SimpleNamespace(message_id=51)
+    bot.send_document.side_effect = TelegramBadRequest(
+        method=object(), message="document rejected",
+    )
+    items = [
+        PreparedMedia(
+            path=None, as_document=False, order=0,
+            media_type=MediaType.IMAGE, telegram_file_id="photo-id",
+        ),
+        PreparedMedia(
+            path=None, as_document=True, order=1,
+            media_type=MediaType.DOCUMENT, telegram_file_id="document-id",
+        ),
+    ]
+
+    with pytest.raises(UncertainPublishError, match="частично"):
+        await TelegramPublisher(bot).preview(-1001, items, "caption")
+
+
+async def test_bad_request_before_any_message_remains_regular_publish_error():
+    bot = bot_mock()
+    bot.send_photo.side_effect = TelegramBadRequest(
+        method=object(), message="photo rejected",
+    )
+
+    with pytest.raises(PublishError) as captured:
+        await TelegramPublisher(bot).preview(-1001, [prepared(0)], "caption")
+
+    assert not isinstance(captured.value, UncertainPublishError)

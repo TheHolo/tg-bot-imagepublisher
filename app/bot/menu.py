@@ -15,6 +15,7 @@ from aiogram.types import (
 from app.db.models import Channel
 
 ADD_BUTTON = "➕ Добавить публикацию"
+NEWS_BUTTON = "📰 Добавить новость"
 QUEUE_BUTTON = "📋 Очередь"
 PREVIEW_BUTTON = "🖼 Следующий пост"
 STATS_BUTTON = "📊 Статистика"
@@ -51,7 +52,8 @@ COMMAND_CATALOG = (
     CommandHelp("start", "/start", "Открыть главное меню", "открывает главное меню и постоянную клавиатуру.", "Навигация"),
     CommandHelp("menu", "/menu", "Открыть главное меню", "повторно показывает главное меню.", "Навигация"),
     CommandHelp("help", "/help", "Показать памятку", "показывает актуальную памятку по всем командам.", "Навигация"),
-    CommandHelp("new", "/new", "Добавить публикацию", "запускает пошаговый мастер: ссылки, канал, подпись и подтверждение.", "Навигация"),
+    CommandHelp("new", "/new", "Добавить публикацию", "запускает пошаговый мастер публикации изображений.", "Навигация"),
+    CommandHelp("news", "/news", "Добавить новость", "принимает статью, YouTube, t.me-ссылку, пересланный пост или ручной текст и отправляет его домашнему AI-worker.", "Навигация"),
     CommandHelp("queue", "/queue [alias]", "Показать очередь", "без аргумента показывает общую очередь; с alias — очередь канала, число постов и время до её завершения.", "Очередь и публикации"),
     CommandHelp("preview", "/preview [job_id|alias]", "Предпросмотр следующего поста", "без аргумента показывает ближайший ожидающий или запланированный пост; с ID — указанное задание; с alias — ближайший пост канала.", "Очередь и публикации"),
     CommandHelp("publish", "/publish [job_id]", "Опубликовать без ожидания", "ставит ближайшее или указанное ожидающее/запланированное задание на ручную публикацию.", "Очередь и публикации"),
@@ -109,7 +111,7 @@ def render_help() -> str:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=ADD_BUTTON)],
+            [KeyboardButton(text=ADD_BUTTON), KeyboardButton(text=NEWS_BUTTON)],
             [KeyboardButton(text=QUEUE_BUTTON), KeyboardButton(text=PREVIEW_BUTTON)],
             [KeyboardButton(text=STATS_BUTTON), KeyboardButton(text=CHANNELS_BUTTON)],
             [KeyboardButton(text=HEALTH_BUTTON), KeyboardButton(text=HELP_BUTTON)],

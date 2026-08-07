@@ -34,11 +34,16 @@ async def test_existing_database_gets_additive_columns(tmp_path):
                 column["name"] for column in inspect(sync_connection).get_columns("jobs")
             }
         )
+        tables = await connection.run_sync(
+            lambda sync_connection: set(inspect(sync_connection).get_table_names())
+        )
     assert "active_job_id" in channel_columns
     assert "is_paused" in channel_columns
     assert "caption_override" in job_columns
     assert "queue_position" in job_columns
     assert "scheduled_at" in job_columns
+    assert "content_kind" in job_columns
+    assert "news_tasks" in tables
     await engine.dispose()
 
 

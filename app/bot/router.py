@@ -43,11 +43,14 @@ from app.bot.menu import (
     queue_menu_keyboard,
     render_help,
 )
+from app.bot.news_ui import news_preview_keyboard, news_task_keyboard
 from app.bot.states import CreatePublication, EditPreview, ManageChannel, ManageQueue
 from app.db.models import Channel, Job
-from app.domain.enums import ACTIVE_JOB_STATUSES, JobStatus
-from app.domain.exceptions import ApplicationError
+from app.domain.enums import ACTIVE_JOB_STATUSES, ContentKind, JobStatus
+from app.domain.exceptions import ApplicationError, UnsupportedSourceError
 from app.domain.models import SourcePost
+from app.news.classifier import classify_news_input
+from app.news.models import NewsSourceRequest
 from app.services.channel_stats_service import (
     ChannelStatsService,
     ChannelSubscriberStats,
@@ -56,10 +59,13 @@ from app.services.channel_stats_service import (
 from app.services.health_service import HealthService, render_health_report
 from app.services.ingest_service import IngestService
 from app.services.job_service import QUEUE_FILTER_STATUSES, JobService, serialize_post
+from app.services.news_submission_service import NewsSubmissionService
+from app.services.news_task_service import NewsTaskService
 from app.services.preview_service import PreviewService, deserialize_post
 from app.services.translation_service import TranslationService
 from app.utils.datetime_input import format_schedule_datetime, parse_schedule_datetime
 from app.utils.durations import format_duration, parse_duration
+from app.utils.input import split_source_selection
 from app.utils.queue_schedule import (
     estimate_queue_schedule,
     format_countdown,
@@ -411,6 +417,8 @@ def build_router(
     ingest: IngestService, jobs: JobService, previews: PreviewService,
     translator: TranslationService, health: HealthService,
     channel_stats: ChannelStatsService, wakeup, registry, settings,
+    *, news_submissions: NewsSubmissionService | None = None,
+    news_tasks: NewsTaskService | None = None,
 ) -> Router:
     router = Router()
 
@@ -418,6 +426,10 @@ def build_router(
         if not settings.auto_add_source_tags:
             return user_tags
         return merge_tags(user_tags, source_tags, settings.max_tags, settings.max_tag_length)
+
+    def is_news_job(job: Job) -> bool:
+        value = getattr(job, "content_kind", job.post_data.get("content_kind", "artwork"))
+        return ContentKind(value) == ContentKind.NEWS
 
     def schedule_example() -> str:
         tomorrow = datetime.now(ZoneInfo(settings.timezone)) + timedelta(days=1)
@@ -653,11 +665,22 @@ def build_router(
         post = deserialize_post(stored.post_data)
         combined_tags = effective_tags(stored.user_tags, stored.source_tags)
         prefix = f"Ссылка {position}/{total}\n\n" if total > 1 else ""
-        caption = await previews.caption(stored)
         publication_time = (
             format_schedule_datetime(stored.scheduled_at, settings.timezone)
             if getattr(stored, "scheduled_at", None) is not None else "по очереди"
         )
+        if post.content_kind == ContentKind.NEWS:
+            return stored, (
+                prefix
+                + f"📰 <b>Черновик новости #{stored.id}</b>\n"
+                + f"Название: {escape(post.title[:160])}\n"
+                + f"Медиа: {len(post.media_items)}\n"
+                + f"Канал: <code>{escape(stored.channel.alias)}</code>\n"
+                + f"Время публикации: {escape(publication_time)}\n"
+                + f"Длина текста: {len(await previews.caption(stored))} символов\n\n"
+                + "Полный предпросмотр отправляется отдельным сообщением."
+            )
+        caption = await previews.caption(stored)
         return stored, (
             prefix
             + f"Источник: {escape(provider_label(post.provider))}\n"
@@ -684,9 +707,46 @@ def build_router(
             text,
             parse_mode="HTML",
             reply_markup=(
-                queued_preview_keyboard(stored.id) if queued else preview_keyboard(stored.id)
+                news_preview_keyboard(
+                    stored.id,
+                    len(stored.post_data.get("media_items", [])),
+                    queued=queued or getattr(stored, "status", None) in {
+                        JobStatus.QUEUED, JobStatus.SCHEDULED,
+                    },
+                )
+                if is_news_job(stored)
+                else queued_preview_keyboard(stored.id) if queued else preview_keyboard(stored.id)
             ),
         )
+
+    async def queue_news_requests(
+        message: Message, requests: list[NewsSourceRequest], tags: list[str],
+        alias: str | None,
+    ) -> None:
+        if news_submissions is None or news_tasks is None:
+            await message.answer("Обработка новостей в этой сборке не настроена.")
+            return
+        for request in requests:
+            try:
+                queued = await news_submissions.create(
+                    telegram_user_id=message.from_user.id,
+                    username=message.from_user.username,
+                    display_name=message.from_user.full_name,
+                    origin_chat_id=message.chat.id,
+                    request=request,
+                    user_tags=tags,
+                    channel_alias=alias,
+                )
+            except (TypeError, ValueError) as error:
+                await message.answer(str(error))
+                continue
+            status = await message.answer(
+                f"📰 Обработка новости #{queued.task.id}\n"
+                f"Канал: {queued.channel.alias}\n"
+                "Текущий этап: ожидаем домашний обработчик",
+                reply_markup=news_task_keyboard(queued.task.id),
+            )
+            await news_tasks.set_status_message(queued.task.id, status.message_id)
 
     async def create_preview_messages(
         message: Message, user_id: int, posts: list[tuple[int, SourcePost]], channel: Channel,
@@ -1667,19 +1727,36 @@ def build_router(
                 )
             )
             return
-        if job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED}:
+        waiting_news = job.status == JobStatus.WAITING_CONFIRMATION and is_news_job(job)
+        if job.status not in {JobStatus.QUEUED, JobStatus.SCHEDULED} and not waiting_news:
             await message.answer(f"Задание #{job.id} уже не находится в очереди.")
             return
+        preview_error: str | None = None
         try:
             await previews.send(job, message.chat.id)
         except ApplicationError as error:
-            await message.answer(f"Не удалось подготовить предпросмотр задания #{job.id}: {error}")
-            return
+            if not waiting_news:
+                await message.answer(
+                    f"Не удалось подготовить предпросмотр задания #{job.id}: {error}"
+                )
+                return
+            preview_error = str(error)
+        news = is_news_job(job)
         await message.answer(
             f"Предпросмотр задания #{job.id} · {escape(job.channel.alias)}"
             f"{' · ' + format_countdown(estimate) if estimate else ''}. "
-            "Очередь и интервал не изменены.",
-            reply_markup=queued_preview_keyboard(job.id),
+            + (
+                f"Предпросмотр медиа не удался: {escape(preview_error)}"
+                if preview_error else "Очередь и интервал не изменены."
+            ),
+            reply_markup=(
+                news_preview_keyboard(
+                    job.id,
+                    len(job.post_data.get("media_items", [])),
+                    queued=not waiting_news,
+                )
+                if news else queued_preview_keyboard(job.id)
+            ),
         )
 
     @router.message(Command("preview"))
@@ -1882,11 +1959,19 @@ def build_router(
         if data.get("job_id") != job_id or data.get("schedule_context") != context:
             await callback.answer("Ввод времени уже завершён.", show_alert=True)
             return
+        job = await jobs.get(job_id)
         await state.clear()
+        news = job is not None and is_news_job(job)
         await callback.message.edit_text(
             "Назначение времени отменено.",
             reply_markup=(
-                queued_preview_keyboard(job_id)
+                news_preview_keyboard(
+                    job_id,
+                    len(job.post_data.get("media_items", [])) if job is not None else 0,
+                    queued=context == "queued",
+                )
+                if news
+                else queued_preview_keyboard(job_id)
                 if context == "queued" else preview_keyboard(job_id)
             ),
         )
@@ -2323,8 +2408,34 @@ def build_router(
     async def submission(message: Message, state: FSMContext) -> None:
         try:
             urls, tags, alias = ingest.parse(message.text)
+            artwork_urls: list[str] = []
+            news_requests: list[NewsSourceRequest] = []
+            for source in urls:
+                url, selection = split_source_selection(source)
+                try:
+                    if hasattr(registry, "resolve"):
+                        registry.resolve(url)
+                except UnsupportedSourceError:
+                    if selection is not None:
+                        await message.answer(
+                            "Выбор отдельных медиа в квадратных скобках доступен только "
+                            "для художественных источников."
+                        )
+                        return
+                    news_requests.append(classify_news_input(url))
+                else:
+                    artwork_urls.append(source)
+            if artwork_urls and news_requests:
+                await message.answer(
+                    "Ссылки на новости и изображения отправьте отдельными сообщениями."
+                )
+                return
+            if news_requests:
+                await state.clear()
+                await queue_news_requests(message, news_requests, tags, alias)
+                return
             if alias is None and not tags:
-                await begin_wizard(message, state, urls, tags)
+                await begin_wizard(message, state, artwork_urls, tags)
                 return
             user = await jobs.ensure_user(
                 message.from_user.id, message.from_user.username, message.from_user.full_name,
@@ -2337,11 +2448,11 @@ def build_router(
             if not channel:
                 await message.answer("Канал не найден или отключён. Проверьте --channel и CHANNELS_JSON.")
                 return
-            posts, failures = await fetch_posts(urls)
+            posts, failures = await fetch_posts(artwork_urls)
             await create_preview_messages(
-                message, user.id, posts, channel, tags, len(urls),
+                message, user.id, posts, channel, tags, len(artwork_urls),
             )
-            await send_failures(message, failures, len(urls))
+            await send_failures(message, failures, len(artwork_urls))
         except ApplicationError as error:
             await message.answer(str(error))
         except Exception:
